@@ -1,23 +1,20 @@
-# Testnet4 stack (Vorflux / Linux) — portable `/btcfullord`
+# Testnet4 stack (Docker Compose)
 
-This folder is the **cloud-portable** equivalent of the local Windows launcher
-`F:\Users\akhil\Main\testnet4` (`/btcfullord`).
+A portable **bitcoind + ord --index-sats** testnet4 stack for live protocol verification. It runs anywhere Docker is available (Linux host, VM, or cloud box).
 
-| Local (Windows) | This folder (Linux / Vorflux) |
-|-----------------|-------------------------------|
-| `start-bitcoind.ps1` | `docker compose` service `bitcoind` |
-| `start-ord.ps1` | `docker compose` service `ord` (built @ ord `1ad3f64` / 0.27.1) |
-| Ports 48332 / 8080 | Same host ports |
-| Data on `F:\` | Docker volumes `bitcoind-data`, `ord-data` |
+| Service | Purpose | Host port |
+|---------|---------|-----------|
+| `bitcoind` | Bitcoin Core, testnet4, `txindex` | 48332 (RPC) |
+| `ord` | `ord --index-sats` (built @ ord `1ad3f64` / 0.27.1) | 8080 (HTTP) |
+| Data | Docker volumes | `bitcoind-data`, `ord-data` |
 
-Explorer (`btc-rpc-explorer`) is optional and omitted here — protocol gates only need **bitcoind + ord --index-sats**.
+An explorer (`btc-rpc-explorer`) is intentionally omitted — protocol gates only need **bitcoind + ord --index-sats**.
 
 ## Disk / RAM budget
 
-Measured on the local workstation (2026-07): ~14 GB bitcoind + ~9 GB ord with all index flags.
-Plan for **≥ 80 GB disk** and **≥ 8 GB RAM** (Vorflux Large or a DO/AWS box with 8 GiB+).
+Budget **≥ 80 GB disk** and **≥ 8 GB RAM** (~14 GB bitcoind + ~9 GB ord with all index flags, plus headroom).
 
-First sync (IBD + ord index) takes **hours**. Do **not** rely on an idle-auto-stop agent VM for that — see [VORFLUX.md](../../VORFLUX.md).
+First sync (IBD + ord sat index) takes **hours**, so run this on a **persistent host** — an ephemeral / idle-auto-stopping VM will not finish the sync.
 
 ## Quick start
 
@@ -30,14 +27,15 @@ docker compose up -d --build
 curl -sS http://127.0.0.1:8080/status
 ```
 
-Point the protocol at:
+Point the reference implementation at it:
 
 ```bash
-export ORD_BASE_URL=http://127.0.0.1:8080
+export SAT_ASSET_ORD_BASE_URL=http://127.0.0.1:8080
+npm test   # re-runs the suite against the live node
 ```
 
 ## Security
 
 - Never commit `.env`.
-- Bind RPC to private network only in production-like clouds (firewall 48332/8080 to Vorflux / your IP).
+- Bind RPC to private network only in production-like clouds (firewall 48332/8080 to your IP).
 - Testnet4 only — no mainnet keys on this stack.

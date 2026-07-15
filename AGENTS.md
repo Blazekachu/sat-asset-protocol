@@ -131,9 +131,6 @@ New major choices → new ADR before code merges. Never delete ADRs; supersede w
 | [README.md](README.md) | Human orientation |
 | [ROADMAP.md](ROADMAP.md) | Phases and gates |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | ADR process, evidence standards |
-| [AGENT_LINEUP.md](AGENT_LINEUP.md) | Which agent role per phase; chat templates |
-| **[sessions/README.md](sessions/README.md)** | **Open these — one file per Cursor chat** |
-| **[CURSOR_AGENTS.md](CURSOR_AGENTS.md)** | **Which Cursor mode + subagent per phase** |
 
 ---
 

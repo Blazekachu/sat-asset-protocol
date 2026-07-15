@@ -3,7 +3,7 @@
 Open commerce metaprotocol for trading Bitcoin satoshis — built on [Ordinal Theory](https://docs.ordinals.com/overview.html), not replacing it.
 
 **Status:** Research complete · Phase 2 reference implementation in progress (TypeScript)  
-**Vorflux:** [VORFLUX.md](./VORFLUX.md) · portable testnet4: [infra/testnet4](./infra/testnet4)
+**Portable testnet4 stack:** [infra/testnet4](./infra/testnet4)
 
 ---
 
@@ -31,11 +31,8 @@ It does **not** reimplement sat indexing, store inscription payloads, or replace
 | Audit discipline (✅🟡🔴) | [REVERSE_ENGINEERING.md](./REVERSE_ENGINEERING.md) |
 | Licensing & ethics | [docs/ORD_LICENSING_AND_ETHICS.md](./docs/ORD_LICENSING_AND_ETHICS.md) |
 | Roadmap | [ROADMAP.md](./ROADMAP.md) |
-| Agent lineup (per phase) | [AGENT_LINEUP.md](./AGENT_LINEUP.md) |
-| **Agent sessions (open & copy prompt)** | **[sessions/README.md](./sessions/README.md)** |
-| **Which Cursor agent per phase** | **[CURSOR_AGENTS.md](./CURSOR_AGENTS.md)** |
 | Contributing (incl. ADRs) | [CONTRIBUTING.md](./CONTRIBUTING.md) |
-| Vorflux + cloud testnet4 | [VORFLUX.md](./VORFLUX.md) |
+| Portable testnet4 stack | [infra/testnet4](./infra/testnet4) |
 
 ---
 
@@ -67,13 +64,13 @@ Bitcoin mainnet / testnet4
 
 ## Local Development
 
-**Windows workstation** — workspace testnet4 stack ([`testnet4/`](../testnet4/), `/btcfullord`):
+The reference implementation is zero-dependency TypeScript run directly on Node 22 (no build step):
 
-- bitcoind testnet4 — RPC `127.0.0.1:48332`
-- ord — HTTP `127.0.0.1:8080` (all index flags)
-- Verified 2026-07-07: `sat_index=true`, ord 0.27.1
+```
+npm test   # node --experimental-strip-types --test
+```
 
-**Linux / Vorflux / cloud** — portable compose stack: [`infra/testnet4`](./infra/testnet4) (see [VORFLUX.md](./VORFLUX.md)).
+Live verification against a real node needs `ord --index-sats` (HTTP `127.0.0.1:8080`, `sat_index=true`) backed by Bitcoin Core with `txindex` on testnet4. Point the implementation at it with `SAT_ASSET_ORD_BASE_URL`. A portable Docker Compose stack is in [`infra/testnet4`](./infra/testnet4); first sync (IBD + ord sat index) takes hours and needs ≥ 80 GB disk, so run it on a persistent host, not an ephemeral VM.
 
 ---
 
