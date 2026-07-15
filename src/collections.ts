@@ -61,7 +61,7 @@ function satToHeightAndOffset(satNumber: bigint): { height: bigint; offset: bigi
   return { height: low, offset: satNumber - blockStart };
 }
 
-function rarityOfSat(satNumber: bigint): keyof typeof rarityRank {
+export function rarityOfSat(satNumber: bigint): keyof typeof rarityRank {
   if (satNumber === 0n) {
     return "mythic";
   }
@@ -87,7 +87,7 @@ function rarityOfSat(satNumber: bigint): keyof typeof rarityRank {
   return "uncommon";
 }
 
-function satName(satNumber: bigint): string {
+export function satName(satNumber: bigint): string {
   let value = SAT_SUPPLY - satNumber;
   let encoded = "";
 

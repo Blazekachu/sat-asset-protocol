@@ -75,6 +75,51 @@ export interface AttestationRecord {
   created_at: string;
 }
 
+// --- Sat-for-sat offers (v2, ADR-0014) ------------------------------------
+
+export type OfferStatus = "open" | "accepted" | "cancelled";
+
+/**
+ * A persisted sat-for-sat offer. The offerer proposes trading their sat
+ * (`offerer_sat_number` at `offerer_asset_outpoint`) for the taker's sat
+ * (`taker_sat_number` at `taker_asset_outpoint`). `offer_psbt` is the
+ * offerer-signed offer PSBT; `accept_psbt` is populated once the taker fully
+ * signs and the offer transitions to "accepted".
+ */
+export interface OfferRecord {
+  offer_id: string;
+  offerer_sat_number: number;
+  offerer_asset_outpoint: string;
+  taker_sat_number: number;
+  taker_asset_outpoint: string;
+  offer_psbt: string;
+  accept_psbt: string | null;
+  status: OfferStatus;
+  created_at: string;
+  expires_at: string | null;
+}
+
+export interface CreateOfferRequest {
+  offerer_sat_number: number;
+  offerer_asset_outpoint: string;
+  taker_sat_number: number;
+  taker_asset_outpoint: string;
+  offer_psbt: string;
+  offerer_signed_inputs?: number[];
+  expires_at?: string | null;
+}
+
+/**
+ * Filter contract for {@link ListingStore.listOffers}. All fields are optional;
+ * a query with no fields returns all offers. Provided fields are applied as
+ * exact-match filters.
+ */
+export interface OfferQuery {
+  taker_sat_number?: number;
+  offerer_sat_number?: number;
+  status?: OfferStatus;
+}
+
 export interface ListingStore {
   insertListing(listing: ListingRecord): void;
   getListing(listingId: string): ListingRecord | null;
@@ -83,4 +128,8 @@ export interface ListingStore {
   getCollection(collectionId: string): CollectionRecord | null;
   insertAttestation(attestation: AttestationRecord): void;
   listAttestationsBySat(subjectSat: number): AttestationRecord[];
+  insertOffer(record: OfferRecord): void;
+  getOffer(offerId: string): OfferRecord | null;
+  updateOfferAccept(offerId: string, acceptPsbt: string): OfferRecord | null;
+  listOffers(query?: OfferQuery): OfferRecord[];
 }

@@ -6,6 +6,9 @@ import type {
   ListingQuery,
   ListingRecord,
   ListingStore,
+  OfferQuery,
+  OfferRecord,
+  OfferStatus,
 } from "./listing-types.ts";
 
 function mapListingRow(row: Record<string, unknown>): ListingRecord {
@@ -28,6 +31,21 @@ function mapListingRow(row: Record<string, unknown>): ListingRecord {
       row.sat_range_size === null || row.sat_range_size === undefined
         ? null
         : Number(row.sat_range_size),
+  };
+}
+
+function mapOfferRow(row: Record<string, unknown>): OfferRecord {
+  return {
+    offer_id: String(row.offer_id),
+    offerer_sat_number: Number(row.offerer_sat_number),
+    offerer_asset_outpoint: String(row.offerer_asset_outpoint),
+    taker_sat_number: Number(row.taker_sat_number),
+    taker_asset_outpoint: String(row.taker_asset_outpoint),
+    offer_psbt: String(row.offer_psbt),
+    accept_psbt: row.accept_psbt === null ? null : String(row.accept_psbt),
+    status: String(row.status) as OfferStatus,
+    created_at: String(row.created_at),
+    expires_at: row.expires_at === null ? null : String(row.expires_at),
   };
 }
 
@@ -74,6 +92,22 @@ export class SqliteListingStore implements ListingStore {
       );
       CREATE INDEX IF NOT EXISTS attestations_subject_sat_idx
         ON attestations (subject_sat, created_at DESC);
+      CREATE TABLE IF NOT EXISTS offers (
+        offer_id TEXT PRIMARY KEY,
+        offerer_sat_number INTEGER NOT NULL,
+        offerer_asset_outpoint TEXT NOT NULL,
+        taker_sat_number INTEGER NOT NULL,
+        taker_asset_outpoint TEXT NOT NULL,
+        offer_psbt TEXT NOT NULL,
+        accept_psbt TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at TEXT NOT NULL,
+        expires_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS offers_taker_status_idx
+        ON offers (taker_sat_number, status);
+      CREATE INDEX IF NOT EXISTS offers_offerer_status_idx
+        ON offers (offerer_sat_number, status);
     `);
 
     this.#migrateListingRangeColumns();
@@ -304,5 +338,111 @@ export class SqliteListingStore implements ListingStore {
           created_at: String(typedRow.created_at),
         } satisfies AttestationRecord;
       });
+  }
+
+  insertOffer(record: OfferRecord): void {
+    this.#database
+      .prepare(`
+        INSERT INTO offers (
+          offer_id,
+          offerer_sat_number,
+          offerer_asset_outpoint,
+          taker_sat_number,
+          taker_asset_outpoint,
+          offer_psbt,
+          accept_psbt,
+          status,
+          created_at,
+          expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        record.offer_id,
+        record.offerer_sat_number,
+        record.offerer_asset_outpoint,
+        record.taker_sat_number,
+        record.taker_asset_outpoint,
+        record.offer_psbt,
+        record.accept_psbt,
+        record.status,
+        record.created_at,
+        record.expires_at,
+      );
+  }
+
+  getOffer(offerId: string): OfferRecord | null {
+    const row = this.#database
+      .prepare(`
+        SELECT
+          offer_id,
+          offerer_sat_number,
+          offerer_asset_outpoint,
+          taker_sat_number,
+          taker_asset_outpoint,
+          offer_psbt,
+          accept_psbt,
+          status,
+          created_at,
+          expires_at
+        FROM offers
+        WHERE offer_id = ?
+        LIMIT 1
+      `)
+      .get(offerId) as Record<string, unknown> | undefined;
+
+    return row ? mapOfferRow(row) : null;
+  }
+
+  updateOfferAccept(offerId: string, acceptPsbt: string): OfferRecord | null {
+    this.#database
+      .prepare(`
+        UPDATE offers
+        SET accept_psbt = ?, status = 'accepted'
+        WHERE offer_id = ?
+      `)
+      .run(acceptPsbt, offerId);
+
+    return this.getOffer(offerId);
+  }
+
+  listOffers(query: OfferQuery = {}): OfferRecord[] {
+    const conditions: string[] = [];
+    const values: Array<number | string> = [];
+
+    if (query.taker_sat_number !== undefined) {
+      conditions.push("taker_sat_number = ?");
+      values.push(query.taker_sat_number);
+    }
+
+    if (query.offerer_sat_number !== undefined) {
+      conditions.push("offerer_sat_number = ?");
+      values.push(query.offerer_sat_number);
+    }
+
+    if (query.status !== undefined) {
+      conditions.push("status = ?");
+      values.push(query.status);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    const statement = this.#database.prepare(`
+      SELECT
+        offer_id,
+        offerer_sat_number,
+        offerer_asset_outpoint,
+        taker_sat_number,
+        taker_asset_outpoint,
+        offer_psbt,
+        accept_psbt,
+        status,
+        created_at,
+        expires_at
+      FROM offers
+      ${whereClause}
+      ORDER BY created_at DESC, offer_id DESC
+    `);
+
+    return statement.all(...values).map((row) => mapOfferRow(row as Record<string, unknown>));
   }
 }
