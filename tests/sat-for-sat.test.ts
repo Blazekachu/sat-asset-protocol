@@ -5,6 +5,7 @@ import {
   buildUnsignedTransaction,
   encodeMapEntry,
   encodeWitnessUtxoMap,
+  inputHasSighashAllSignature,
   parsePsbt,
   PSBT_MAGIC,
   PsbtValidationError,
@@ -75,7 +76,12 @@ interface InputSpec {
 // A synthetic signature to inject into an input map.
 type SigSpec =
   | { kind: "partial"; sighash: number }
-  | { kind: "tap"; length: 64 | 65; sighash?: number };
+  // Inject a raw PSBT_IN_PARTIAL_SIG (0x02) value verbatim — used to craft
+  // empty/one-byte/malformed fake signatures.
+  | { kind: "rawPartial"; value: Buffer }
+  | { kind: "tap"; length: 64 | 65; sighash?: number }
+  // Inject a raw PSBT_IN_TAP_KEY_SIG (0x13) value verbatim.
+  | { kind: "rawTap"; value: Buffer };
 
 interface OutputSpec {
   valueSats: number;
@@ -103,18 +109,24 @@ function buildSatForSatPsbt(inputs: InputSpec[], outputs: OutputSpec[]): string 
     if (spec.sig?.kind === "partial") {
       const pubkey = Buffer.from("02".repeat(33), "hex");
       const key = Buffer.concat([Buffer.from([0x02]), pubkey]);
-      // A synthetic DER-ish sig body followed by the sighash byte.
+      // A plausible-DER ECDSA sig body followed by the sighash byte.
       const value = Buffer.concat([
         Buffer.from("3006020101020101", "hex"),
         Buffer.from([spec.sig.sighash]),
       ]);
       entries.push(encodeMapEntry(key, value));
+    } else if (spec.sig?.kind === "rawPartial") {
+      const pubkey = Buffer.from("02".repeat(33), "hex");
+      const key = Buffer.concat([Buffer.from([0x02]), pubkey]);
+      entries.push(encodeMapEntry(key, spec.sig.value));
     } else if (spec.sig?.kind === "tap") {
       const value = Buffer.alloc(spec.sig.length, 0x11);
       if (spec.sig.length === 65) {
         value[64] = spec.sig.sighash ?? 0x00;
       }
       entries.push(encodeMapEntry(Buffer.from([0x13]), value));
+    } else if (spec.sig?.kind === "rawTap") {
+      entries.push(encodeMapEntry(Buffer.from([0x13]), spec.sig.value));
     }
 
     return Buffer.concat([...entries, Buffer.from([0x00])]);
@@ -408,4 +420,267 @@ test("fee-payer variant: offerer A signs [0,1,4] and validates", () => {
     offererSignedInputs: [0, 1, 4],
   });
   assert.deepEqual(summary.offererSignedInputs, [0, 1, 4]);
+});
+
+// --- BLOCKING 1: malformed/fake signatures must be rejected ---------------
+
+test("parsePsbt marks empty/one-byte partial sigs and empty tap sigs as not ALL-equivalent", () => {
+  const inputs = CANONICAL_INPUTS();
+  inputs[0].sig = { kind: "rawPartial", value: Buffer.alloc(0) }; // empty
+  inputs[1].sig = { kind: "rawPartial", value: Buffer.from([0x00]) }; // one-byte 0x00
+  inputs[2].sig = { kind: "rawTap", value: Buffer.alloc(0) }; // empty tap
+  const psbt = buildSatForSatPsbt(inputs, CANONICAL_OUTPUTS);
+
+  const parsed = parsePsbt(psbt);
+  // They still register as present signature entries...
+  assert.equal(parsed.inputs[0].partialSigCount, 1);
+  assert.equal(parsed.inputs[1].partialSigCount, 1);
+  assert.equal(parsed.inputs[2].partialSigCount, 1);
+  // ...but none are structurally valid SIGHASH_ALL signatures.
+  assert.equal(inputHasSighashAllSignature(parsed.inputs[0]), false);
+  assert.equal(inputHasSighashAllSignature(parsed.inputs[1]), false);
+  assert.equal(inputHasSighashAllSignature(parsed.inputs[2]), false);
+});
+
+test("validateSatForSatOfferPsbt rejects a one-byte 0x00 fake partial sig on an offerer input", () => {
+  const inputs = CANONICAL_INPUTS();
+  inputs[0].sig = { kind: "partial", sighash: 0x01 };
+  inputs[1].sig = { kind: "rawPartial", value: Buffer.from([0x00]) }; // fake
+  const psbt = buildSatForSatPsbt(inputs, CANONICAL_OUTPUTS);
+
+  assert.throws(
+    () =>
+      validateSatForSatOfferPsbt(psbt, {
+        offererAssetOutpoint: A_ASSET.outpoint,
+        takerAssetOutpoint: B_ASSET.outpoint,
+      }),
+    (error: unknown) =>
+      error instanceof PsbtValidationError && /input 1 must carry a valid/.test(error.message),
+  );
+});
+
+test("validateSatForSatOfferPsbt rejects a 65-byte tap sig with an explicit 0x00 sighash byte", () => {
+  const inputs = CANONICAL_INPUTS();
+  inputs[0].sig = { kind: "tap", length: 64 };
+  // 65-byte tap sig must carry explicit 0x01; 0x00 as an explicit byte is invalid.
+  const badTap = Buffer.alloc(65, 0x11);
+  badTap[64] = 0x00;
+  inputs[1].sig = { kind: "rawTap", value: badTap };
+  const psbt = buildSatForSatPsbt(inputs, CANONICAL_OUTPUTS);
+
+  assert.throws(
+    () =>
+      validateSatForSatOfferPsbt(psbt, {
+        offererAssetOutpoint: A_ASSET.outpoint,
+        takerAssetOutpoint: B_ASSET.outpoint,
+      }),
+    (error: unknown) =>
+      error instanceof PsbtValidationError && /input 1 must carry a valid/.test(error.message),
+  );
+});
+
+test("validateSatForSatAcceptPsbt rejects an accept whose sigs are all one-byte 0x00 fakes", () => {
+  const offerInputs = CANONICAL_INPUTS();
+  offerInputs[0].sig = { kind: "partial", sighash: 0x01 };
+  offerInputs[1].sig = { kind: "partial", sighash: 0x01 };
+  const offer = buildSatForSatPsbt(offerInputs, CANONICAL_OUTPUTS);
+
+  // All five "signatures" are one-byte 0x00 values — count as present but invalid.
+  const acceptInputs = CANONICAL_INPUTS();
+  acceptInputs.forEach((spec) => {
+    spec.sig = { kind: "rawPartial", value: Buffer.from([0x00]) };
+  });
+  const accept = buildSatForSatPsbt(acceptInputs, CANONICAL_OUTPUTS);
+
+  assert.throws(
+    () => validateSatForSatAcceptPsbt(accept, offer),
+    (error: unknown) =>
+      error instanceof PsbtValidationError && /must carry a valid/.test(error.message),
+  );
+});
+
+test("validateSatForSatAcceptPsbt rejects an accept whose tap sigs are all empty", () => {
+  const offerInputs = CANONICAL_INPUTS();
+  offerInputs[0].sig = { kind: "partial", sighash: 0x01 };
+  offerInputs[1].sig = { kind: "partial", sighash: 0x01 };
+  const offer = buildSatForSatPsbt(offerInputs, CANONICAL_OUTPUTS);
+
+  const acceptInputs = CANONICAL_INPUTS();
+  acceptInputs.forEach((spec) => {
+    spec.sig = { kind: "rawTap", value: Buffer.alloc(0) };
+  });
+  const accept = buildSatForSatPsbt(acceptInputs, CANONICAL_OUTPUTS);
+
+  assert.throws(
+    () => validateSatForSatAcceptPsbt(accept, offer),
+    (error: unknown) =>
+      error instanceof PsbtValidationError && /must carry a valid/.test(error.message),
+  );
+});
+
+test("validateSatForSatAcceptPsbt accepts 64-byte Taproot key sigs across all inputs", () => {
+  const offerInputs = CANONICAL_INPUTS();
+  offerInputs[0].sig = { kind: "partial", sighash: 0x01 };
+  offerInputs[1].sig = { kind: "partial", sighash: 0x01 };
+  const offer = buildSatForSatPsbt(offerInputs, CANONICAL_OUTPUTS);
+
+  const acceptInputs = CANONICAL_INPUTS();
+  acceptInputs.forEach((spec) => {
+    spec.sig = { kind: "tap", length: 64 };
+  });
+  const accept = buildSatForSatPsbt(acceptInputs, CANONICAL_OUTPUTS);
+
+  assert.deepEqual(validateSatForSatAcceptPsbt(accept, offer), { ready: true });
+});
+
+// --- BLOCKING 2: offerer_signed_inputs must always cover 0 and 1 ----------
+
+test("validateSatForSatOfferPsbt rejects offerer_signed_inputs: [] (empty removes commitments)", () => {
+  const inputs = CANONICAL_INPUTS();
+  inputs[0].sig = { kind: "partial", sighash: 0x01 };
+  inputs[1].sig = { kind: "partial", sighash: 0x01 };
+  const psbt = buildSatForSatPsbt(inputs, CANONICAL_OUTPUTS);
+
+  assert.throws(
+    () =>
+      validateSatForSatOfferPsbt(psbt, {
+        offererAssetOutpoint: A_ASSET.outpoint,
+        takerAssetOutpoint: B_ASSET.outpoint,
+        offererSignedInputs: [],
+      }),
+    (error: unknown) =>
+      error instanceof PsbtValidationError && /\[0,1\] or \[0,1,4\]/.test(error.message),
+  );
+});
+
+test("validateSatForSatOfferPsbt rejects an offerer_signed_inputs set missing input 0 or 1", () => {
+  const inputs = CANONICAL_INPUTS();
+  inputs[0].sig = { kind: "partial", sighash: 0x01 };
+  inputs[1].sig = { kind: "partial", sighash: 0x01 };
+  const psbt = buildSatForSatPsbt(inputs, CANONICAL_OUTPUTS);
+
+  for (const bad of [[1], [0], [1, 4], [0, 4], [2, 3]]) {
+    assert.throws(
+      () =>
+        validateSatForSatOfferPsbt(psbt, {
+          offererAssetOutpoint: A_ASSET.outpoint,
+          takerAssetOutpoint: B_ASSET.outpoint,
+          offererSignedInputs: bad,
+        }),
+      (error: unknown) =>
+        error instanceof PsbtValidationError && /\[0,1\] or \[0,1,4\]/.test(error.message),
+      `expected rejection for offererSignedInputs=${JSON.stringify(bad)}`,
+    );
+  }
+});
+
+test("validateSatForSatOfferPsbt rejects duplicate / out-of-range offerer_signed_inputs", () => {
+  const inputs = CANONICAL_INPUTS();
+  inputs[0].sig = { kind: "partial", sighash: 0x01 };
+  inputs[1].sig = { kind: "partial", sighash: 0x01 };
+  const psbt = buildSatForSatPsbt(inputs, CANONICAL_OUTPUTS);
+
+  for (const bad of [[0, 1, 1], [0, 0, 1], [0, 1, 5], [0, 1, 2]]) {
+    assert.throws(
+      () =>
+        validateSatForSatOfferPsbt(psbt, {
+          offererAssetOutpoint: A_ASSET.outpoint,
+          takerAssetOutpoint: B_ASSET.outpoint,
+          offererSignedInputs: bad,
+        }),
+      (error: unknown) =>
+        error instanceof PsbtValidationError && /\[0,1\] or \[0,1,4\]/.test(error.message),
+      `expected rejection for offererSignedInputs=${JSON.stringify(bad)}`,
+    );
+  }
+});
+
+test("validateSatForSatOfferPsbt accepts [1,0] (unordered) as the canonical [0,1] set", () => {
+  const inputs = CANONICAL_INPUTS();
+  inputs[0].sig = { kind: "partial", sighash: 0x01 };
+  inputs[1].sig = { kind: "partial", sighash: 0x01 };
+  const psbt = buildSatForSatPsbt(inputs, CANONICAL_OUTPUTS);
+
+  const summary = validateSatForSatOfferPsbt(psbt, {
+    offererAssetOutpoint: A_ASSET.outpoint,
+    takerAssetOutpoint: B_ASSET.outpoint,
+    offererSignedInputs: [1, 0],
+  });
+  assert.deepEqual(summary.offererSignedInputs, [0, 1]);
+});
+
+// --- SHOULD-FIX 5: value conservation / non-negative fee ------------------
+
+test("buildSatForSatOfferPsbt rejects a fee-payer change larger than the fee input", () => {
+  const params = buildOfferParams();
+  // FEE_INPUT is 5000; ask for change > input value.
+  params.feePayerChangeValueSats = 6000;
+  assert.throws(
+    () => buildSatForSatOfferPsbt(params),
+    (error: unknown) =>
+      error instanceof PsbtValidationError && /exceeds fee-funding input/.test(error.message),
+  );
+});
+
+test("buildSatForSatOfferPsbt rejects an offer whose total outputs exceed total inputs (negative fee)", () => {
+  // Because outputs[0..3] are forced equal to inputs[0..3] (FIFO offset-0), the
+  // only way total_out can exceed total_in is fee-payer change > fee input — the
+  // exact negative-implied-fee condition. Both the per-output and aggregate
+  // conservation guards catch it; the per-output guard fires first.
+  const params = buildOfferParams();
+  params.feeFundingInput = { ...FEE_INPUT, valueSats: 400 };
+  params.feePayerChangeValueSats = 500; // > fee input => implied fee negative
+  assert.throws(
+    () => buildSatForSatOfferPsbt(params),
+    (error: unknown) =>
+      error instanceof PsbtValidationError &&
+      /(exceeds fee-funding input|implied fee would be negative)/.test(error.message),
+  );
+});
+
+test("validateSatForSatOfferPsbt rejects an offer whose fee-payer change exceeds the fee input", () => {
+  const inputs = CANONICAL_INPUTS();
+  inputs[0].sig = { kind: "partial", sighash: 0x01 };
+  inputs[1].sig = { kind: "partial", sighash: 0x01 };
+  const outputs = CANONICAL_OUTPUTS.map((o) => ({ ...o }));
+  outputs[4].valueSats = 6000; // > FEE_INPUT (5000)
+  const psbt = buildSatForSatPsbt(inputs, outputs);
+
+  assert.throws(
+    () =>
+      validateSatForSatOfferPsbt(psbt, {
+        offererAssetOutpoint: A_ASSET.outpoint,
+        takerAssetOutpoint: B_ASSET.outpoint,
+      }),
+    (error: unknown) =>
+      error instanceof PsbtValidationError && /exceeds fee-funding input/.test(error.message),
+  );
+});
+
+test("validateSatForSatOfferPsbt rejects an offer whose outputs exceed inputs (negative fee)", () => {
+  // Shrink the fee input so total out > total in. Because the FIFO invariant
+  // forces outputs[0..3] == inputs[0..3], a negative implied fee is exactly
+  // output[4] > input[4]; either the per-output or aggregate guard rejects it.
+  const smallFee: TemplateInput = { ...FEE_INPUT, valueSats: 400 };
+  const inputs: InputSpec[] = [
+    { input: A_BUMP, sig: { kind: "partial", sighash: 0x01 } },
+    { input: A_ASSET, sig: { kind: "partial", sighash: 0x01 } },
+    { input: B_BUMP },
+    { input: B_ASSET },
+    { input: smallFee },
+  ];
+  const outputs = CANONICAL_OUTPUTS.map((o) => ({ ...o }));
+  outputs[4].valueSats = 500; // > fee input (400) => total out > total in
+  const psbt = buildSatForSatPsbt(inputs, outputs);
+
+  assert.throws(
+    () =>
+      validateSatForSatOfferPsbt(psbt, {
+        offererAssetOutpoint: A_ASSET.outpoint,
+        takerAssetOutpoint: B_ASSET.outpoint,
+      }),
+    (error: unknown) =>
+      error instanceof PsbtValidationError &&
+      /(exceeds fee-funding input|implied fee would be negative)/.test(error.message),
+  );
 });

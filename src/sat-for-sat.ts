@@ -31,12 +31,13 @@ import {
   buildUnsignedTransaction,
   encodeMapEntry,
   encodeWitnessUtxoMap,
-  isSighashAllEquivalent,
+  inputHasSighashAllSignature,
   parsePsbt,
   PSBT_MAGIC,
   PsbtValidationError,
   unsignedTxBytes,
   type DustPolicy,
+  type ParsedPsbt,
   type TemplateInput,
 } from "./psbt.ts";
 
@@ -134,8 +135,6 @@ export function buildSatForSatOfferPsbt(
     assertOutputAboveDust(output.scriptPubkeyHex, output.valueSats, minRelayFeeSatPerVb);
   }
 
-  const unsignedTransaction = buildUnsignedTransaction(inputOutpoints, outputs);
-
   const witnessInputs: TemplateInput[] = [
     partyA.bumpInput,
     partyA.assetInput,
@@ -143,6 +142,25 @@ export function buildSatForSatOfferPsbt(
     partyB.assetInput,
     params.feeFundingInput,
   ];
+
+  // Value conservation: the fee-payer change (output[4]) is caller-supplied, so
+  // it must not exceed the fee-funding input and the transaction must leave a
+  // non-negative implied miner fee. A negative fee is unbroadcastable.
+  if (params.feePayerChangeValueSats > params.feeFundingInput.valueSats) {
+    throw new PsbtValidationError(
+      `fee_payer_change ${params.feePayerChangeValueSats} exceeds fee-funding input value ${params.feeFundingInput.valueSats}`,
+    );
+  }
+
+  const totalIn = witnessInputs.reduce((sum, input) => sum + input.valueSats, 0);
+  const totalOut = outputValues.reduce((sum, value) => sum + value, 0);
+  if (totalOut > totalIn) {
+    throw new PsbtValidationError(
+      `sat-for-sat outputs (${totalOut}) exceed inputs (${totalIn}); implied fee would be negative`,
+    );
+  }
+
+  const unsignedTransaction = buildUnsignedTransaction(inputOutpoints, outputs);
 
   const inputMaps: Buffer[] = witnessInputs
     .map((input) => encodeWitnessUtxoMap(input.valueSats, input.scriptPubkeyHex))
@@ -224,7 +242,7 @@ export function validateSatForSatOfferPsbt(
     }
   }
 
-  const offererSignedInputs = expected.offererSignedInputs ?? [0, 1];
+  const offererSignedInputs = normalizeOffererSignedInputs(expected.offererSignedInputs);
 
   for (const index of offererSignedInputs) {
     const input = parsed.inputs[index];
@@ -238,9 +256,9 @@ export function validateSatForSatOfferPsbt(
         `Sat-for-sat offer input ${index} must be signed by the offerer`,
       );
     }
-    if (!isSighashAllEquivalent(input.sighashType)) {
+    if (!inputHasSighashAllSignature(input)) {
       throw new PsbtValidationError(
-        `Sat-for-sat offer input ${index} must be signed with SIGHASH_ALL-equivalent sighash (got ${input.sighashType})`,
+        `Sat-for-sat offer input ${index} must carry a valid SIGHASH_ALL-equivalent signature`,
       );
     }
   }
@@ -255,12 +273,72 @@ export function validateSatForSatOfferPsbt(
   }
 
   assertAllOutputsAboveDust(parsed.outputs);
+  assertValueConservation(parsed);
 
   return {
     offererSignedInputs,
     buyerAssetOutputIndex: 1,
     sellerAssetOutputIndex: 3,
   };
+}
+
+/**
+ * The offerer must ALWAYS commit to their bump + asset inputs (`0` and `1`).
+ * The only allowed sets are exactly `[0,1]` (accepter is fee payer) or
+ * `[0,1,4]` (offerer is fee payer). Anything else — an empty array, missing
+ * `0`/`1`, duplicates, out-of-range indices, or arbitrary alternatives — is
+ * rejected so a caller cannot suppress the required offerer commitments.
+ */
+function normalizeOffererSignedInputs(requested: number[] | undefined): number[] {
+  if (requested === undefined) {
+    return [0, 1];
+  }
+
+  const sorted = [...requested].sort((a, b) => a - b);
+  const isBaseSet = sorted.length === 2 && sorted[0] === 0 && sorted[1] === 1;
+  const isFeePayerSet =
+    sorted.length === 3 && sorted[0] === 0 && sorted[1] === 1 && sorted[2] === 4;
+
+  if (!isBaseSet && !isFeePayerSet) {
+    throw new PsbtValidationError(
+      "offerer_signed_inputs must be exactly [0,1] or [0,1,4] (offerer must always sign inputs 0 and 1)",
+    );
+  }
+
+  return sorted;
+}
+
+/**
+ * Assert value conservation: sum(inputs) >= sum(outputs) (implied miner fee is
+ * non-negative) and output[4] (fee-payer change) does not exceed input[4]'s
+ * witness_utxo value. All five inputs must carry witness_utxo values.
+ */
+function assertValueConservation(parsed: ParsedPsbt): void {
+  let totalIn = 0;
+  for (let index = 0; index < parsed.inputs.length; index += 1) {
+    const witnessValue = parsed.inputs[index].witnessUtxoValue;
+    if (witnessValue === null) {
+      throw new PsbtValidationError(
+        `Sat-for-sat offer input ${index} missing witness_utxo value`,
+      );
+    }
+    totalIn += witnessValue;
+  }
+
+  const feeInputValue = parsed.inputs[4].witnessUtxoValue ?? 0;
+  const feeChangeValue = parsed.outputs[4].value;
+  if (feeChangeValue > feeInputValue) {
+    throw new PsbtValidationError(
+      `Sat-for-sat fee-payer change ${feeChangeValue} exceeds fee-funding input value ${feeInputValue}`,
+    );
+  }
+
+  const totalOut = parsed.outputs.reduce((sum, output) => sum + output.value, 0);
+  if (totalOut > totalIn) {
+    throw new PsbtValidationError(
+      `Sat-for-sat outputs (${totalOut}) exceed inputs (${totalIn}); implied fee would be negative`,
+    );
+  }
 }
 
 /**
@@ -296,9 +374,9 @@ export function validateSatForSatAcceptPsbt(
         `Sat-for-sat accept input ${index} must be signed`,
       );
     }
-    if (!isSighashAllEquivalent(input.sighashType)) {
+    if (!inputHasSighashAllSignature(input)) {
       throw new PsbtValidationError(
-        `Sat-for-sat accept input ${index} must carry SIGHASH_ALL-equivalent sighash (got ${input.sighashType})`,
+        `Sat-for-sat accept input ${index} must carry a valid SIGHASH_ALL-equivalent signature`,
       );
     }
   }

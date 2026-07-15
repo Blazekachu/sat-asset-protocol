@@ -39,11 +39,30 @@ interface ReaderState {
   offset: number;
 }
 
+export type PsbtSignatureSource = "partial_sig" | "tap_key_sig";
+
+/**
+ * A single parsed signature entry from a PSBT input, keeping the signature
+ * *source* alongside its sighash so consumers can apply source-specific rules.
+ * `sighashAllEquivalent` is true only for a structurally well-formed signature
+ * that commits to SIGHASH_ALL — i.e. a 64-byte Taproot key signature
+ * (SIGHASH_DEFAULT), a 65-byte Taproot key signature with an explicit `0x01`
+ * byte, or a plausible-DER ECDSA partial signature with a `0x01` sighash byte.
+ * Malformed, empty, or non-ALL signatures are `false`.
+ */
+export interface ParsedPsbtSignature {
+  source: PsbtSignatureSource;
+  sighashType: number | null;
+  sighashAllEquivalent: boolean;
+}
+
 export interface ParsedPsbtInput {
   outpoint: string;
   sequence: number;
   sighashType: number | null;
   partialSigCount: number;
+  /** Per-signature detail (source + sighash + ALL-equivalence). */
+  signatures: ParsedPsbtSignature[];
   witnessUtxoValue: number | null;
   witnessUtxoScriptPubkeyHex: string | null;
 }
@@ -360,9 +379,74 @@ export function unsignedTxBytes(psbtBase64: string): Buffer {
  * Both SIGHASH_DEFAULT (`0x00`, Taproot 64-byte key-sig) and SIGHASH_ALL
  * (`0x01`) commit to all inputs and outputs, so consumers treat them as
  * equivalent. `null` (no sighash present) is not considered equivalent.
+ *
+ * NOTE: this raw-value check does not distinguish signature *source*. `0x00`
+ * is only safe for a 64-byte Taproot key signature; for an ECDSA partial
+ * signature `0x00` is not a valid sighash flag. Prefer
+ * {@link inputHasSighashAllSignature}, which enforces source-specific structural
+ * validity. This helper is retained for the legacy per-value use in
+ * {@link parseListingPsbt} consumers that supply their own explicit sighash
+ * range checks.
  */
 export function isSighashAllEquivalent(sighashType: number | null): boolean {
   return sighashType === 0x00 || sighashType === 0x01;
+}
+
+/**
+ * True when an input carries at least one structurally valid SIGHASH_ALL(-
+ * equivalent) signature. This is the safe gate for "is this input actually
+ * signed with a full-commitment signature", rejecting empty/one-byte/malformed
+ * signature values that would otherwise be mistaken for SIGHASH_DEFAULT.
+ */
+export function inputHasSighashAllSignature(input: ParsedPsbtInput): boolean {
+  return input.signatures.some((signature) => signature.sighashAllEquivalent);
+}
+
+/**
+ * Classify a raw PSBT_IN_PARTIAL_SIG (`0x02`) value. A legacy/segwit ECDSA
+ * signature is a DER-encoded signature followed by a single sighash byte, so
+ * the minimum plausible length is a DER header (`0x30 len`) plus the two
+ * INTEGER components plus the trailing sighash byte. We do not fully verify the
+ * DER, but we require the DER sequence tag, a self-consistent length, and an
+ * explicit trailing sighash byte. Only `0x01` (SIGHASH_ALL) is ALL-equivalent
+ * for an ECDSA partial signature (`0x00` is NOT a valid ECDSA sighash flag).
+ */
+function classifyPartialSig(value: Buffer): ParsedPsbtSignature {
+  // Smallest realistic DER ECDSA sig: 30 06 02 01 xx 02 01 xx = 8 bytes, plus
+  // the trailing sighash byte = 9 bytes total.
+  const looksLikeDer =
+    value.length >= 9 &&
+    value[0] === 0x30 &&
+    // DER content length byte matches the bytes between it and the sighash byte.
+    value[1] === value.length - 3;
+  const sighashType = value.length > 0 ? (value[value.length - 1] ?? null) : null;
+  return {
+    source: "partial_sig",
+    sighashType,
+    sighashAllEquivalent: looksLikeDer && sighashType === 0x01,
+  };
+}
+
+/**
+ * Classify a raw PSBT_IN_TAP_KEY_SIG (`0x13`) value (BIP371). A Taproot
+ * key-path signature is exactly 64 bytes (implicit SIGHASH_DEFAULT `0x00`) or
+ * 65 bytes (the 65th byte is an explicit sighash flag, which must be `0x01`
+ * SIGHASH_ALL to be ALL-equivalent; `0x00` is disallowed as an explicit byte).
+ * Any other length (including empty) is malformed and not ALL-equivalent.
+ */
+function classifyTapKeySig(value: Buffer): ParsedPsbtSignature {
+  if (value.length === 64) {
+    return { source: "tap_key_sig", sighashType: 0x00, sighashAllEquivalent: true };
+  }
+  if (value.length === 65) {
+    const sighashType = value[64] ?? null;
+    return {
+      source: "tap_key_sig",
+      sighashType,
+      sighashAllEquivalent: sighashType === 0x01,
+    };
+  }
+  return { source: "tap_key_sig", sighashType: null, sighashAllEquivalent: false };
 }
 
 export function parsePsbt(psbtBase64: string): ParsedPsbt {
@@ -372,29 +456,20 @@ export function parsePsbt(psbtBase64: string): ParsedPsbt {
   const inputs: ParsedPsbtInput[] = unsignedTransaction.inputs.map((input, index) => {
     const inputEntries = structure.inputMaps[index] ?? [];
 
-    let sighashType: number | null = null;
-    let partialSigCount = 0;
+    const signatures: ParsedPsbtSignature[] = [];
+    let explicitSighashType: number | null = null;
     let witnessUtxoValue: number | null = null;
     let witnessUtxoScriptPubkeyHex: string | null = null;
 
     for (const entry of inputEntries) {
       const keyType = entry.key[0];
       if (keyType === 0x02) {
-        partialSigCount += 1;
-        if (entry.value.length > 0 && sighashType === null) {
-          sighashType = entry.value[entry.value.length - 1] ?? null;
-        }
+        signatures.push(classifyPartialSig(entry.value));
       } else if (keyType === 0x03 && entry.value.length >= 4) {
-        sighashType = entry.value.readUInt32LE(0);
+        // PSBT_IN_SIGHASH_TYPE: an explicit whole-input sighash declaration.
+        explicitSighashType = entry.value.readUInt32LE(0);
       } else if (keyType === 0x13) {
-        // PSBT_IN_TAP_KEY_SIG (BIP371): a Taproot key-path signature. A 65-byte
-        // signature carries an explicit sighash byte as its last byte; a
-        // 64-byte signature implies SIGHASH_DEFAULT (0x00). Sats overwhelmingly
-        // live in P2TR, so a present tap-key-sig counts as a partial signature.
-        partialSigCount += 1;
-        if (sighashType === null) {
-          sighashType = entry.value.length === 65 ? (entry.value[64] ?? 0x00) : 0x00;
-        }
+        signatures.push(classifyTapKeySig(entry.value));
       } else if (keyType === 0x01) {
         const witnessUtxo = parseWitnessUtxo(entry.value);
         witnessUtxoValue = witnessUtxo.value;
@@ -402,11 +477,16 @@ export function parsePsbt(psbtBase64: string): ParsedPsbt {
       }
     }
 
+    // Surface a single representative sighash for back-compat consumers: an
+    // explicit PSBT_IN_SIGHASH_TYPE (0x03) wins, else the first signature's.
+    const sighashType = explicitSighashType ?? signatures[0]?.sighashType ?? null;
+
     return {
       outpoint: input.outpoint,
       sequence: input.sequence,
       sighashType,
-      partialSigCount,
+      partialSigCount: signatures.length,
+      signatures,
       witnessUtxoValue,
       witnessUtxoScriptPubkeyHex,
     };
