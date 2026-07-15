@@ -19,6 +19,7 @@ import {
   parseListingPsbt,
   PsbtValidationError,
   validateCanonicalTwoBumpFillPsbt,
+  type TemplateInput,
 } from "./psbt.ts";
 import { buildSatForSatOfferPsbt, type SatForSatAssetSide } from "./sat-for-sat.ts";
 import type { OrdSat, OrdStatus } from "./types.ts";
@@ -138,6 +139,29 @@ function parseTemplateInput(value: unknown, fieldName: string): TemplateInputPay
   return { outpoint, value_sats: valueSats, script_pubkey_hex: scriptPubkeyHex };
 }
 
+function parseAssetTypeQueryParam(url: URL): CreateListingRequest["asset_type"] | undefined {
+  const assetTypeText = url.searchParams.get("asset_type");
+  if (assetTypeText === null || assetTypeText.trim() === "") {
+    return undefined;
+  }
+
+  if (assetTypeText !== "sat" && assetTypeText !== "range" && assetTypeText !== "utxo") {
+    throw new ListingValidationError(
+      `asset_type query param must be one of "sat", "range", "utxo"`,
+    );
+  }
+
+  return assetTypeText;
+}
+
+function toTemplateInput(payload: TemplateInputPayload): TemplateInput {
+  return {
+    outpoint: payload.outpoint,
+    valueSats: payload.value_sats,
+    scriptPubkeyHex: payload.script_pubkey_hex,
+  };
+}
+
 function parseSatForSatSide(value: unknown, fieldName: string): SatForSatAssetSide {
   if (!value || typeof value !== "object") {
     throw new ListingValidationError(`${fieldName} must be an object`);
@@ -156,16 +180,8 @@ function parseSatForSatSide(value: unknown, fieldName: string): SatForSatAssetSi
   );
 
   return {
-    bumpInput: {
-      outpoint: bumpInput.outpoint,
-      valueSats: bumpInput.value_sats,
-      scriptPubkeyHex: bumpInput.script_pubkey_hex,
-    },
-    assetInput: {
-      outpoint: assetInput.outpoint,
-      valueSats: assetInput.value_sats,
-      scriptPubkeyHex: assetInput.script_pubkey_hex,
-    },
+    bumpInput: toTemplateInput(bumpInput),
+    assetInput: toTemplateInput(assetInput),
     changeScriptPubkeyHex,
     counterpartyOrdinalsScriptPubkeyHex,
   };
@@ -287,22 +303,7 @@ export function createApp(dependencies: AppDependencies): AppInstance {
           const sat_number = parseOptionalIntQueryParam(url, "sat_number");
           const sat_range_start = parseOptionalIntQueryParam(url, "sat_range_start");
           const sat_range_size = parseOptionalIntQueryParam(url, "sat_range_size");
-
-          const assetTypeText = url.searchParams.get("asset_type");
-          let asset_type: CreateListingRequest["asset_type"] | undefined;
-          if (assetTypeText !== null && assetTypeText.trim() !== "") {
-            if (
-              assetTypeText !== "sat" &&
-              assetTypeText !== "range" &&
-              assetTypeText !== "utxo"
-            ) {
-              throw new ListingValidationError(
-                `asset_type query param must be one of "sat", "range", "utxo"`,
-              );
-            }
-
-            asset_type = assetTypeText;
-          }
+          const asset_type = parseAssetTypeQueryParam(url);
 
           const listings = listingService.listOpenListings({
             sat_number,
@@ -550,16 +551,8 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             sellerInputValueSats: parsedListingPsbt.input0WitnessUtxoValue,
             sellerInputScriptPubkeyHex: parsedListingPsbt.input0WitnessUtxoScriptPubkeyHex,
             listingPriceSats: listing.price_sats,
-            bumpInputs: bumpInputs.map((input) => ({
-              outpoint: input.outpoint,
-              valueSats: input.value_sats,
-              scriptPubkeyHex: input.script_pubkey_hex,
-            })),
-            fundingInputs: fundingInputs.map((input) => ({
-              outpoint: input.outpoint,
-              valueSats: input.value_sats,
-              scriptPubkeyHex: input.script_pubkey_hex,
-            })),
+            bumpInputs: bumpInputs.map(toTemplateInput),
+            fundingInputs: fundingInputs.map(toTemplateInput),
             buyerBumpScriptPubkeyHex,
             buyerAssetScriptPubkeyHex,
             buyerChangeScriptPubkeyHex,
@@ -593,11 +586,7 @@ export function createApp(dependencies: AppDependencies): AppInstance {
           const template = buildSatForSatOfferPsbt({
             partyA,
             partyB,
-            feeFundingInput: {
-              outpoint: feeFundingInput.outpoint,
-              valueSats: feeFundingInput.value_sats,
-              scriptPubkeyHex: feeFundingInput.script_pubkey_hex,
-            },
+            feeFundingInput: toTemplateInput(feeFundingInput),
             feePayerChangeScriptPubkeyHex,
             feePayerChangeValueSats,
             dustPolicy,
@@ -651,22 +640,7 @@ export function createApp(dependencies: AppDependencies): AppInstance {
           const namePrefix = url.searchParams.get("name_prefix") ?? undefined;
           const minRarity = url.searchParams.get("rarity") ?? undefined;
           const satNumberFilter = parseOptionalIntQueryParam(url, "sat_number");
-
-          const assetTypeText = url.searchParams.get("asset_type");
-          let assetTypeFilter: CreateListingRequest["asset_type"] | undefined;
-          if (assetTypeText !== null && assetTypeText.trim() !== "") {
-            if (
-              assetTypeText !== "sat" &&
-              assetTypeText !== "range" &&
-              assetTypeText !== "utxo"
-            ) {
-              throw new ListingValidationError(
-                `asset_type query param must be one of "sat", "range", "utxo"`,
-              );
-            }
-
-            assetTypeFilter = assetTypeText;
-          }
+          const assetTypeFilter = parseAssetTypeQueryParam(url);
 
           if (minRarity !== undefined && !(minRarity.toLowerCase() in RARITY_RANK)) {
             throw new ListingValidationError("rarity query param is invalid");

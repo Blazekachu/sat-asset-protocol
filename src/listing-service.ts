@@ -20,7 +20,7 @@ export interface ListingServiceDependencies {
 
 export class ListingValidationError extends Error {}
 
-function ensureInteger(value: unknown, fieldName: string): number {
+export function ensureInteger(value: unknown, fieldName: string): number {
   if (typeof value !== "number" || !Number.isInteger(value)) {
     throw new ListingValidationError(`${fieldName} must be an integer`);
   }
@@ -28,7 +28,7 @@ function ensureInteger(value: unknown, fieldName: string): number {
   return value;
 }
 
-function ensureRequiredString(value: unknown, fieldName: string): string {
+export function ensureRequiredString(value: unknown, fieldName: string): string {
   if (typeof value !== "string" || value.trim() === "") {
     throw new ListingValidationError(`${fieldName} is required`);
   }

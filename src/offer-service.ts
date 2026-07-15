@@ -6,7 +6,13 @@
 // fully-signed accept PSBT before marking the offer accepted. The protocol
 // never holds keys — signatures are produced by the parties out of band.
 
-import { assertOffsetZero, ListingValidationError, type ListingOrdClient } from "./listing-service.ts";
+import {
+  assertOffsetZero,
+  ensureInteger,
+  ensureRequiredString,
+  ListingValidationError,
+  type ListingOrdClient,
+} from "./listing-service.ts";
 import type {
   CreateOfferRequest,
   ListingStore,
@@ -26,22 +32,6 @@ export interface OfferServiceDependencies {
   ordClient: ListingOrdClient;
   now?: () => Date;
   createOfferId?: () => string;
-}
-
-function ensureInteger(value: unknown, fieldName: string): number {
-  if (typeof value !== "number" || !Number.isInteger(value)) {
-    throw new ListingValidationError(`${fieldName} must be an integer`);
-  }
-
-  return value;
-}
-
-function ensureRequiredString(value: unknown, fieldName: string): string {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new ListingValidationError(`${fieldName} is required`);
-  }
-
-  return value;
 }
 
 export class OfferService {
