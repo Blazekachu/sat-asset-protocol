@@ -1,0 +1,25 @@
+{
+  "name": "listing-seller",
+  "validated_at": "2026-07-12",
+  "network": "testnet4",
+  "adr": [
+    "ADR-0005",
+    "ADR-0006",
+    "ADR-0007"
+  ],
+  "seller_wallet": "sap-s05-seller",
+  "asset_outpoint": "209e0ab7966fec80992ba1a66bfc3543628027c6dd90a9c73593c4b9f33b5436:0",
+  "asset_value_sats": 4000,
+  "seller_payment_address": "tb1quundq0yjcj563922ttnkapxx3ym429hyc4pnsy",
+  "listing_price_sats": 1000,
+  "seller_input_index": 0,
+  "seller_output_index": 0,
+  "sighash_type": "SINGLE|ANYONECANPAY",
+  "psbt_base64": "cHNidP8BAFICAAAAATZUO/O5xJM1x6mQ3cYngGJDNfxrpqErmYDsb5a3Cp4gAAAAAAD9////AegDAAAAAAAAFgAU5ybQPJLEqaiVSlrnboTGiTdVFuQAAAAAAAEA/eUDAgAAABQCAbiGO3XVsb7MUSOgIPica7lyuzPOrz+gjbA203KQhzQAAAAA/f///wIBuIY7ddWxvsxRI6Ag+JxruXK7M86vP6CNsDbTcpCHOgAAAAD9////AgG4hjt11bG+zFEjoCD4nGu5crszzq8/oI2wNtNykIcuAAAAAP3///8CAbiGO3XVsb7MUSOgIPica7lyuzPOrz+gjbA203KQhysAAAAA/f///wIBuIY7ddWxvsxRI6Ag+JxruXK7M86vP6CNsDbTcpCHHgAAAAD9////AgG4hjt11bG+zFEjoCD4nGu5crszzq8/oI2wNtNykIcHAAAAAP3///8CAbiGO3XVsb7MUSOgIPica7lyuzPOrz+gjbA203KQh2AAAAAA/f///wIBuIY7ddWxvsxRI6Ag+JxruXK7M86vP6CNsDbTcpCHNQAAAAD9////AgG4hjt11bG+zFEjoCD4nGu5crszzq8/oI2wNtNykIcTAAAAAP3///8CAbiGO3XVsb7MUSOgIPica7lyuzPOrz+gjbA203KQh0MAAAAA/f///wIBuIY7ddWxvsxRI6Ag+JxruXK7M86vP6CNsDbTcpCHRwAAAAD9////AgG4hjt11bG+zFEjoCD4nGu5crszzq8/oI2wNtNykIdJAAAAAP3///8CAbiGO3XVsb7MUSOgIPica7lyuzPOrz+gjbA203KQh04AAAAA/f///wIBuIY7ddWxvsxRI6Ag+JxruXK7M86vP6CNsDbTcpCHHwAAAAD9////AgG4hjt11bG+zFEjoCD4nGu5crszzq8/oI2wNtNykIccAAAAAP3///8CAbiGO3XVsb7MUSOgIPica7lyuzPOrz+gjbA203KQhwMAAAAA/f///wIBuIY7ddWxvsxRI6Ag+JxruXK7M86vP6CNsDbTcpCHPQAAAAD9////AgG4hjt11bG+zFEjoCD4nGu5crszzq8/oI2wNtNykIczAAAAAP3///8CAbiGO3XVsb7MUSOgIPica7lyuzPOrz+gjbA203KQh1kAAAAA/f///wIBuIY7ddWxvsxRI6Ag+JxruXK7M86vP6CNsDbTcpCHKgAAAAD9////BaAPAAAAAAAAFgAUM2JPAl6PaLxDapuErkmuOrpiPPGgDwAAAAAAABYAFI0qsAoS5MDToYqTT1v98ozEb5epgwEAAAAAAAAiUSCL102JaSdjvFxN7eEQuxzIs6fLOHefLr+P9MpDbpdFWlgCAAAAAAAAFgAUktYOg4utn9SIJEy09yoSdz8oI0JYAgAAAAAAABYAFOYaJ+pkbpbeFik3RA7buSH31UYlAAAAAAEBH6APAAAAAAAAFgAUM2JPAl6PaLxDapuErkmuOrpiPPEiAgOjKOqEEBa9vafW6aTwzeJWJEWLhSaC6xt/idxBoDxATkcwRAIgWyHyhtJflTkg0Huy8CBx4oqYaGPqn9SaErTwNF4Q1vcCIEznyfSwXZAbLZ02MYR/DYp4/7IjNBrv5ohHOV1Qhen6gyIGA6Mo6oQQFr29p9bppPDN4lYkRYuFJoLrG3+J3EGgPEBOGJ2uSqdUAACAAQAAgAAAAIAAAAAAAAAAAAAiAgIHO09SRSF2L4R3QmjlGQvYxEV9MaLoKJ9HkveWQKlRURidrkqnVAAAgAEAAIAAAACAAAAAAAEAAAAA",
+  "unsigned_txid": "9cd26c5ced2fb897f266af0d3bdc275315d9644fd7db3791a6f23ff25f7746d2",
+  "validation": {
+    "walletprocesspsbt_complete": false,
+    "decoded_fee_sats": 3000,
+    "proof": "Signed live on testnet4 against seller-owned outpoint with SIGHASH_SINGLE|ANYONECANPAY."
+  }
+}

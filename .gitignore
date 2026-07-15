@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.*
+!.env.example
+infra/testnet4/.env
+
+# Orphan Rust lockfile (TS stack per ADR-0012)
+Cargo.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Pinned ord checkout for source audit (reclone per 00_overview.md)
+vendor/ord/
+
+# Data / local index (never commit)
+*.redb
+*.db
+data/
+
+# Build
+dist/
+target/
+
+# Logs
+*.log

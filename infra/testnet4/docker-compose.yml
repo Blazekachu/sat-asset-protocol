@@ -1,0 +1,72 @@
+# Portable /btcfullord equivalent for Linux (Vorflux agent VM or persistent DO/AWS box).
+# Local Windows stack remains: F:\Users\akhil\Main\testnet4 (/btcfullord).
+#
+#   cp .env.example .env
+#   docker compose up -d --build
+#   curl -sS http://127.0.0.1:8080/status
+#
+# Protocol:
+#   ORD_BASE_URL=http://127.0.0.1:8080
+
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:28.1
+    container_name: sap-bitcoind-testnet4
+    restart: unless-stopped
+    volumes:
+      - bitcoind-data:/home/bitcoin/.bitcoin
+      - ./bitcoin.conf:/home/bitcoin/.bitcoin/bitcoin.conf:ro
+    ports:
+      - "48332:48332"
+      - "48333:48333"
+    environment:
+      BITCOIN_RPC_USER: ${BITCOIN_RPC_USER:-ord}
+      BITCOIN_RPC_PASSWORD: ${BITCOIN_RPC_PASSWORD:?set BITCOIN_RPC_PASSWORD in .env}
+    command:
+      - -conf=/home/bitcoin/.bitcoin/bitcoin.conf
+      - -rpcuser=${BITCOIN_RPC_USER:-ord}
+      - -rpcpassword=${BITCOIN_RPC_PASSWORD:?set BITCOIN_RPC_PASSWORD in .env}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -rpcuser=$$BITCOIN_RPC_USER -rpcpassword=$$BITCOIN_RPC_PASSWORD getblockchaininfo >/dev/null || exit 1",
+        ]
+      interval: 30s
+      timeout: 15s
+      retries: 40
+      start_period: 120s
+
+  ord:
+    build:
+      context: .
+      dockerfile: Dockerfile.ord
+      args:
+        ORD_REF: 1ad3f64
+    image: sap-ord:0.27.1
+    container_name: sap-ord-testnet4
+    restart: unless-stopped
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      ORD_BITCOIN_RPC_USERNAME: ${BITCOIN_RPC_USER:-ord}
+      ORD_BITCOIN_RPC_PASSWORD: ${BITCOIN_RPC_PASSWORD:?set BITCOIN_RPC_PASSWORD in .env}
+    volumes:
+      - ord-data:/data
+    ports:
+      - "8080:80"
+    command:
+      - --chain=testnet4
+      - --bitcoin-rpc-url=http://bitcoind:48332
+      - --data-dir=/data
+      - --index-sats
+      - --index-runes
+      - --index-addresses
+      - --index-transactions
+      - server
+      - --http-port=80
+
+volumes:
+  bitcoind-data:
+  ord-data:

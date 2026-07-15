@@ -1,0 +1,53 @@
+{
+  "name": "invalid-offset-nonzero",
+  "validated_at": "2026-07-12",
+  "network": "testnet4",
+  "adr": [
+    "ADR-0007"
+  ],
+  "outpoint": "eb6b02195e1705cbf339f0d52a2641474044a8e7ff8e0dfb4b18f2795c07014a:1",
+  "output_value_sats": 4000,
+  "ord_output_json": {
+    "indexed": true,
+    "confirmations": 1840,
+    "sat_ranges": [
+      [
+        102955507979764,
+        102955507980132
+      ],
+      [
+        102955507993782,
+        102955507994328
+      ],
+      [
+        102955508006340,
+        102955508006886
+      ],
+      [
+        102955507976856,
+        102955507977402
+      ],
+      [
+        102955507987776,
+        102955507988322
+      ],
+      [
+        102955507993236,
+        102955507993782
+      ],
+      [
+        102955507977948,
+        102955507978494
+      ],
+      [
+        102955507989414,
+        102955507989770
+      ]
+    ]
+  },
+  "listed_sat_number": 102955507979765,
+  "computed_offset": 1,
+  "expected_result": "reject",
+  "expected_error": "ADR-0007 offset-0 precondition failed",
+  "proof": "The first sat in the first ord-reported range is 102955507979764, so listing 102955507979765 targets offset 1, not offset 0."
+}
