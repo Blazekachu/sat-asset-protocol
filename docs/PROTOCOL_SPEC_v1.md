@@ -235,7 +235,7 @@ Rules:
 | Seller sighash | `SIGHASH_SINGLE | ANYONECANPAY` (`0x03`) |
 | Seller output index | `0` (payment) |
 | Asset input | Sole occupant of the UTXO **OR** target sat at **offset 0** (ADR-0007) |
-| Minimum postage | **⚠ OPEN-1**: 330 sats (inscription convention) vs 546 sats (dust) — unresolved |
+| Minimum postage | **Resolved — ADR-0015**: bare-sat 546, inscribed 330 (configurable); per-script-type dust enforced |
 
 The seller signs **only** input 0; the asset stays in the seller wallet until fill. Wallets sign the
 exact PSBT with `signPsbt(..., sighashTypes: [0x03])` (UniSat/Xverse/Leather support today, ADR-0005).
@@ -489,11 +489,11 @@ The following are places where source docs/ADRs are ambiguous, under-specified, 
 tension. **None block the draft**, but each needs a human decision (or a new ADR) before reference
 implementation.
 
-- **⚠ OPEN-1 — Minimum postage undecided.** ADR-0006 fixes the *bump* size at 600 sats, but
-  [PSBT Settlement.md §6.1](./PSBT%20Settlement.md) leaves **asset postage** as "330 (inscription
-  convention) or 546 (dust) — TBD", and [Open Questions.md] Q9 (bare-sat postage) is unresolved.
-  *Action:* pick a canonical `asset_postage` (likely 546 dust for bare sats, 330 for inscribed) via
-  ADR before test vectors. **No ADR conflict — an open gap.**
+- **✅ OPEN-1 — Minimum postage — Resolved — ADR-0015.** ADR-0006 fixes the *bump* size at 600 sats;
+  [ADR-0015](./adr/0015-dust-and-canonical-postage.md) now fixes canonical **asset postage** at 546
+  sats for bare sats and 330 for inscribed (both configurable), and defines per-script-type dust via
+  the Bitcoin Core formula with a configurable min-relay fee (default 3 sat/vB). [Open Questions.md]
+  Q8/Q9 are marked Resolved. ADR-0015 does **not** supersede ADR-0006 (600-sat bump preserved).
 
 - **⚠ OPEN-2 — "offset 0" wording vs output index.** ADR-0006 output ordering puts the asset at
   **output index 1**, while ADR-0007 speaks of the asset being "at offset 0". These are consistent
