@@ -5,7 +5,7 @@ import {
   DustValidationError,
 } from "./dust.ts";
 
-const PSBT_MAGIC = Buffer.from("70736274ff", "hex");
+export const PSBT_MAGIC = Buffer.from("70736274ff", "hex");
 
 const DEFAULT_MIN_RELAY_FEE_SAT_PER_VB = 3;
 const DEFAULT_BUMP_SIZE_SATS = 600;
@@ -143,7 +143,7 @@ function readVarInt(reader: ReaderState): number {
   return value;
 }
 
-function encodeVarInt(value: number): Buffer {
+export function encodeVarInt(value: number): Buffer {
   if (!Number.isInteger(value) || value < 0) {
     throw new Error("Cannot encode negative or non-integer varint");
   }
@@ -344,6 +344,27 @@ function parsePsbtUnsignedOnly(psbtBase64: string): {
   return parseUnsignedTransaction(unsignedTxEntry.value);
 }
 
+/**
+ * Return the raw serialized unsigned transaction bytes from the PSBT global-map
+ * `0x00` entry. Reuses the structure parser so the returned buffer is exactly
+ * the version + inputs + outputs + locktime serialization stored in the PSBT.
+ * Used for byte-identical comparison between an offer and its accept PSBT.
+ */
+export function unsignedTxBytes(psbtBase64: string): Buffer {
+  const structure = parsePsbtStructure(psbtBase64);
+  return Buffer.from(structure.unsignedTx);
+}
+
+/**
+ * True when a sighash type is SIGHASH_ALL-equivalent for validation purposes.
+ * Both SIGHASH_DEFAULT (`0x00`, Taproot 64-byte key-sig) and SIGHASH_ALL
+ * (`0x01`) commit to all inputs and outputs, so consumers treat them as
+ * equivalent. `null` (no sighash present) is not considered equivalent.
+ */
+export function isSighashAllEquivalent(sighashType: number | null): boolean {
+  return sighashType === 0x00 || sighashType === 0x01;
+}
+
 export function parsePsbt(psbtBase64: string): ParsedPsbt {
   const structure = parsePsbtStructure(psbtBase64);
   const unsignedTransaction = parseUnsignedTransaction(structure.unsignedTx);
@@ -365,6 +386,15 @@ export function parsePsbt(psbtBase64: string): ParsedPsbt {
         }
       } else if (keyType === 0x03 && entry.value.length >= 4) {
         sighashType = entry.value.readUInt32LE(0);
+      } else if (keyType === 0x13) {
+        // PSBT_IN_TAP_KEY_SIG (BIP371): a Taproot key-path signature. A 65-byte
+        // signature carries an explicit sighash byte as its last byte; a
+        // 64-byte signature implies SIGHASH_DEFAULT (0x00). Sats overwhelmingly
+        // live in P2TR, so a present tap-key-sig counts as a partial signature.
+        partialSigCount += 1;
+        if (sighashType === null) {
+          sighashType = entry.value.length === 65 ? (entry.value[64] ?? 0x00) : 0x00;
+        }
       } else if (keyType === 0x01) {
         const witnessUtxo = parseWitnessUtxo(entry.value);
         witnessUtxoValue = witnessUtxo.value;
@@ -405,13 +435,13 @@ export function parseListingPsbt(psbtBase64: string): ParsedListingPsbt {
   };
 }
 
-function encodeUInt32LE(value: number): Buffer {
+export function encodeUInt32LE(value: number): Buffer {
   const buffer = Buffer.alloc(4);
   buffer.writeUInt32LE(value, 0);
   return buffer;
 }
 
-function encodeUInt64LE(value: number): Buffer {
+export function encodeUInt64LE(value: number): Buffer {
   const buffer = Buffer.alloc(8);
   buffer.writeBigUInt64LE(BigInt(value), 0);
   return buffer;
@@ -426,7 +456,7 @@ function encodeScript(scriptPubkeyHex: string): Buffer {
   return Buffer.concat([encodeVarInt(script.length), script]);
 }
 
-function buildUnsignedTransaction(
+export function buildUnsignedTransaction(
   inputOutpoints: string[],
   outputValuesAndScripts: Array<{ valueSats: number; scriptPubkeyHex: string }>,
 ): Buffer {
@@ -448,11 +478,11 @@ function buildUnsignedTransaction(
   return Buffer.concat(parts);
 }
 
-function encodeMapEntry(key: Buffer, value: Buffer): Buffer {
+export function encodeMapEntry(key: Buffer, value: Buffer): Buffer {
   return Buffer.concat([encodeVarInt(key.length), key, encodeVarInt(value.length), value]);
 }
 
-function encodeWitnessUtxoMap(valueSats: number, scriptPubkeyHex: string): Buffer {
+export function encodeWitnessUtxoMap(valueSats: number, scriptPubkeyHex: string): Buffer {
   const payload = Buffer.concat([encodeUInt64LE(valueSats), encodeScript(scriptPubkeyHex)]);
   return encodeMapEntry(Buffer.from([0x01]), payload);
 }

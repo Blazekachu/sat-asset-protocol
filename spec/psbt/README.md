@@ -33,6 +33,32 @@ Scope:
   - `ord` reports first sat in the first range as `102955507979764`.
   - Targeting `102955507979765` yields offset `1`, so listing must be rejected.
 
+### Sat-for-sat (v2, ADR-0014) — unit/synthetic pending testnet4 spike
+
+These two vectors cover the mirrored 2-bump sat-for-sat swap (ADR-0014). Unlike
+the ADR-0005/0006/0007 vectors above, they are **synthetic unit fixtures**
+(`"network": "synthetic-unit"`), produced by `buildSatForSatOfferPsbt` with
+hand-injected `SIGHASH_ALL` partial signatures. They are **not** broadcast:
+live testnet4 validation is the deferred spike (`SAT_FOR_SAT_SPIKE.md` §7 GO
+gate, esp. E3 foreign-input wallet signing), which requires a persistent
+`ord`+`bitcoind` host and cannot run in an ephemeral VM. It is tracked as an
+ADR-0014 follow-up, not a merge gate.
+
+- `vectors/sat-for-sat-offer.json`
+  - Mirrored 2-bump **offer** PSBT. Party A offers sat X for party B's sat Y.
+  - Input order: `[0] A_bump, [1] A_asset (X@0), [2] B_bump, [3] B_asset (Y@0), [4] fee_funding`.
+  - Output order (FIFO): `[0] A_change, [1] B_ordinals (X→B@0), [2] B_change, [3] A_ordinals (Y→A@0), [4] fee_payer_change`.
+  - Offerer A has signed inputs `[0,1,4]` (`SIGHASH_ALL`); accepter B's inputs
+    `[2,3]` are unsigned. Output values are computed to preserve the FIFO
+    offset-0 invariant.
+
+- `vectors/sat-for-sat-accept.json`
+  - Fully-signed **accept** PSBT whose unsigned transaction is **byte-identical**
+    to the offer (the atomicity/tamper gate) with all 5 inputs signed
+    (`SIGHASH_ALL`). Real P2TR wallets sign these inputs with a
+    `PSBT_IN_TAP_KEY_SIG` (`0x13`); both `SIGHASH_DEFAULT` (`0x00`) and
+    `SIGHASH_ALL` (`0x01`) are treated as SIGHASH_ALL-equivalent.
+
 ## Validation Notes
 
 - The seller listing vector is off-chain by design and was validated by signing a live PSBT against a real testnet4 UTXO.

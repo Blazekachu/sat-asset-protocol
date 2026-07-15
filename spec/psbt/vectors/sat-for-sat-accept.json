@@ -1,0 +1,79 @@
+{
+  "name": "sat-for-sat-accept",
+  "network": "synthetic-unit",
+  "adr": [
+    "ADR-0014"
+  ],
+  "description": "Fully-signed sat-for-sat ACCEPT PSBT: byte-identical unsigned tx to the offer, with all 5 inputs now signed (SIGHASH_ALL). This is the atomicity/tamper gate.",
+  "input_order": [
+    {
+      "index": 0,
+      "role": "A_bump",
+      "outpoint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+      "value_sats": 600,
+      "signer": "A",
+      "sighash": "ALL"
+    },
+    {
+      "index": 1,
+      "role": "A_asset (X @ offset 0)",
+      "outpoint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0",
+      "value_sats": 546,
+      "signer": "A",
+      "sighash": "ALL"
+    },
+    {
+      "index": 2,
+      "role": "B_bump",
+      "outpoint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc:0",
+      "value_sats": 600,
+      "signer": "B",
+      "sighash": "ALL"
+    },
+    {
+      "index": 3,
+      "role": "B_asset (Y @ offset 0)",
+      "outpoint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:0",
+      "value_sats": 546,
+      "signer": "B",
+      "sighash": "ALL"
+    },
+    {
+      "index": 4,
+      "role": "fee_funding",
+      "outpoint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:0",
+      "value_sats": 5000,
+      "signer": "fee_payer (A)",
+      "sighash": "ALL"
+    }
+  ],
+  "output_order": [
+    {
+      "index": 0,
+      "role": "A_change",
+      "value_sats": 600
+    },
+    {
+      "index": 1,
+      "role": "B_ordinals (X -> B @ offset 0)",
+      "value_sats": 546
+    },
+    {
+      "index": 2,
+      "role": "B_change",
+      "value_sats": 600
+    },
+    {
+      "index": 3,
+      "role": "A_ordinals (Y -> A @ offset 0)",
+      "value_sats": 546
+    },
+    {
+      "index": 4,
+      "role": "fee_payer_change",
+      "value_sats": 3000
+    }
+  ],
+  "psbt_base64": "cHNidP8BAP1yAQIAAAAFqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqoAAAAAAP3///+7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7uwAAAAAA/f///8zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMAAAAAAD9////3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0AAAAAAP3////u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7gAAAAAA/f///wVYAgAAAAAAABYAFBERERERERERERERERERERERERERIgIAAAAAAAAWABQiIiIiIiIiIiIiIiIiIiIiIiIiIlgCAAAAAAAAFgAUMzMzMzMzMzMzMzMzMzMzMzMzMzMiAgAAAAAAABYAFEREREREREREREREREREREREREREuAsAAAAAAAAWABRVVVVVVVVVVVVVVVVVVVVVVVVVVQAAAAAAAQEfWAIAAAAAAAAWABShoaGhoaGhoaGhoaGhoaGhoaGhoSICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICCTAGAgEBAgEBAQABAR8iAgAAAAAAABYAFKKioqKioqKioqKioqKioqKioqKiIgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIJMAYCAQECAQEBAAEBH1gCAAAAAAAAFgAUsbGxsbGxsbGxsbGxsbGxsbGxsbEiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgkwBgIBAQIBAQEAAQEfIgIAAAAAAAAWABSysrKysrKysrKysrKysrKysrKysiICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICCTAGAgEBAgEBAQABAR+IEwAAAAAAABYAFO/v7+/v7+/v7+/v7+/v7+/v7+/vIgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIJMAYCAQECAQEBAAAAAAAA",
+  "note": "Synthetic unit vector produced by buildSatForSatOfferPsbt with hand-injected SIGHASH_ALL partial signatures. Not broadcast; live testnet4 validation is the deferred ADR-0014 spike (SAT_FOR_SAT_SPIKE.md), which requires a persistent ord+bitcoind host and cannot run in an ephemeral VM."
+}

@@ -19,6 +19,10 @@ export interface CreateListingRequest {
   seller_address?: string;
   signed_psbt?: string;
   expires_at?: string | null;
+  // Range listings (asset_type="range") declare the sat range being sold. The
+  // range must be pre-isolated into its own UTXO (see ListingService).
+  sat_range_start?: number;
+  sat_range_size?: number;
 }
 
 export interface ListingRecord {
@@ -32,11 +36,26 @@ export interface ListingRecord {
   created_at: string;
   expires_at: string | null;
   cancelled: boolean;
+  // Populated for asset_type="range"; null for "sat"/"utxo".
+  sat_range_start: number | null;
+  sat_range_size: number | null;
 }
 
+/**
+ * Filter contract for {@link ListingStore.listOpenListings}. All fields are
+ * optional; a query with no fields returns all open (non-cancelled) listings.
+ * When a field is provided it is applied as an exact-match filter:
+ * - `sat_number` / `outpoint`: match the listing's sat/outpoint.
+ * - `asset_type`: restrict to one asset kind ("sat" | "range" | "utxo").
+ * - `sat_range_start` / `sat_range_size`: match range listings by their
+ *   persisted range fields (useful for discovering a specific isolated range).
+ */
 export interface ListingQuery {
   sat_number?: number;
   outpoint?: string;
+  asset_type?: ListingAssetType;
+  sat_range_start?: number;
+  sat_range_size?: number;
 }
 
 export interface CollectionRecord {

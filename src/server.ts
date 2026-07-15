@@ -56,6 +56,20 @@ function ensureInteger(value: unknown, fieldName: string): number {
   return value;
 }
 
+function parseOptionalIntQueryParam(url: URL, name: string): number | undefined {
+  const text = url.searchParams.get(name);
+  if (text === null || text.trim() === "") {
+    return undefined;
+  }
+
+  const value = Number.parseInt(text, 10);
+  if (Number.isNaN(value)) {
+    throw new ListingValidationError(`${name} query param must be an integer`);
+  }
+
+  return value;
+}
+
 function ensureNonEmptyString(value: unknown, fieldName: string): string {
   if (typeof value !== "string" || value.trim() === "") {
     throw new ListingValidationError(`${fieldName} is required`);
@@ -150,20 +164,33 @@ export function createApp(dependencies: AppDependencies): AppInstance {
         }
 
         if (method === "GET" && url.pathname === "/v1/listings") {
-          const satNumberText = url.searchParams.get("sat_number");
           const outpoint = url.searchParams.get("outpoint") ?? undefined;
-          const sat_number =
-            satNumberText === null || satNumberText.trim() === ""
-              ? undefined
-              : Number.parseInt(satNumberText, 10);
+          const sat_number = parseOptionalIntQueryParam(url, "sat_number");
+          const sat_range_start = parseOptionalIntQueryParam(url, "sat_range_start");
+          const sat_range_size = parseOptionalIntQueryParam(url, "sat_range_size");
 
-          if (satNumberText !== null && sat_number !== undefined && Number.isNaN(sat_number)) {
-            throw new ListingValidationError("sat_number query param must be an integer");
+          const assetTypeText = url.searchParams.get("asset_type");
+          let asset_type: CreateListingRequest["asset_type"] | undefined;
+          if (assetTypeText !== null && assetTypeText.trim() !== "") {
+            if (
+              assetTypeText !== "sat" &&
+              assetTypeText !== "range" &&
+              assetTypeText !== "utxo"
+            ) {
+              throw new ListingValidationError(
+                `asset_type query param must be one of "sat", "range", "utxo"`,
+              );
+            }
+
+            asset_type = assetTypeText;
           }
 
           const listings = listingService.listOpenListings({
             sat_number,
             outpoint,
+            asset_type,
+            sat_range_start,
+            sat_range_size,
           });
 
           writeJson(response, 200, { listings });
