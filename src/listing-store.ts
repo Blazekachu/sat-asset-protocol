@@ -54,6 +54,12 @@ export class SqliteListingStore implements ListingStore {
 
   constructor(database: DatabaseSync) {
     this.#database = database;
+
+    // Schema setup order is load-bearing: create tables, THEN migrate columns
+    // onto any pre-existing tables, THEN create indexes. Indexes that reference
+    // migrated columns (e.g. listings_open_range_idx on sat_range_start) must
+    // come after the migration or an existing DB missing those columns fails
+    // with "no such column" on startup.
     this.#database.exec(`
       CREATE TABLE IF NOT EXISTS listings (
         listing_id TEXT PRIMARY KEY,
@@ -69,12 +75,6 @@ export class SqliteListingStore implements ListingStore {
         sat_range_start INTEGER,
         sat_range_size INTEGER
       );
-      CREATE INDEX IF NOT EXISTS listings_open_sat_number_idx
-        ON listings (sat_number, cancelled);
-      CREATE INDEX IF NOT EXISTS listings_open_outpoint_idx
-        ON listings (outpoint, cancelled);
-      CREATE INDEX IF NOT EXISTS listings_open_range_idx
-        ON listings (sat_range_start, cancelled);
       CREATE TABLE IF NOT EXISTS collections (
         collection_id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -90,8 +90,6 @@ export class SqliteListingStore implements ListingStore {
         expires_at TEXT,
         created_at TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS attestations_subject_sat_idx
-        ON attestations (subject_sat, created_at DESC);
       CREATE TABLE IF NOT EXISTS offers (
         offer_id TEXT PRIMARY KEY,
         offerer_sat_number INTEGER NOT NULL,
@@ -104,13 +102,24 @@ export class SqliteListingStore implements ListingStore {
         created_at TEXT NOT NULL,
         expires_at TEXT
       );
+    `);
+
+    this.#migrateListingRangeColumns();
+
+    this.#database.exec(`
+      CREATE INDEX IF NOT EXISTS listings_open_sat_number_idx
+        ON listings (sat_number, cancelled);
+      CREATE INDEX IF NOT EXISTS listings_open_outpoint_idx
+        ON listings (outpoint, cancelled);
+      CREATE INDEX IF NOT EXISTS listings_open_range_idx
+        ON listings (sat_range_start, cancelled);
+      CREATE INDEX IF NOT EXISTS attestations_subject_sat_idx
+        ON attestations (subject_sat, created_at DESC);
       CREATE INDEX IF NOT EXISTS offers_taker_status_idx
         ON offers (taker_sat_number, status);
       CREATE INDEX IF NOT EXISTS offers_offerer_status_idx
         ON offers (offerer_sat_number, status);
     `);
-
-    this.#migrateListingRangeColumns();
   }
 
   // Idempotent migration for pre-existing DBs created before the range columns

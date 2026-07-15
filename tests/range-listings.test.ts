@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import test from "node:test";
 
 import { createApp } from "../src/server.ts";
+import { SqliteListingStore } from "../src/listing-store.ts";
 import type { OrdOutput } from "../src/types.ts";
 
 function encodeVarInt(value: number): Buffer {
@@ -412,6 +413,51 @@ test("utxo listing: a spent or unindexed output is rejected", async () => {
       assert.match(body.error, /spent/i);
     },
   );
+});
+
+test("migration: constructing a store over an OLD-schema listings table succeeds and adds range columns + index", () => {
+  const database = new DatabaseSync(":memory:");
+
+  // Simulate a pre-existing DB whose listings table predates the range
+  // columns: no sat_range_start / sat_range_size, and no range index.
+  database.exec(`
+    CREATE TABLE listings (
+      listing_id TEXT PRIMARY KEY,
+      asset_type TEXT NOT NULL,
+      sat_number INTEGER,
+      outpoint TEXT,
+      price_sats INTEGER NOT NULL,
+      seller_address TEXT NOT NULL,
+      signed_psbt TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT,
+      cancelled INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+
+  // The constructor must not throw with "no such column: sat_range_start" —
+  // the column migration has to run before the range index is created.
+  assert.doesNotThrow(() => new SqliteListingStore(database));
+
+  const columns = new Set(
+    database
+      .prepare("PRAGMA table_info(listings)")
+      .all()
+      .map((row) => String((row as Record<string, unknown>).name)),
+  );
+  assert.ok(columns.has("sat_range_start"), "sat_range_start column should exist after migration");
+  assert.ok(columns.has("sat_range_size"), "sat_range_size column should exist after migration");
+
+  const indexes = database
+    .prepare("PRAGMA index_list(listings)")
+    .all()
+    .map((row) => String((row as Record<string, unknown>).name));
+  assert.ok(
+    indexes.includes("listings_open_range_idx"),
+    "listings_open_range_idx should exist after migration",
+  );
+
+  database.close();
 });
 
 test("regression: an asset_type=sat listing still works end to end", async () => {
