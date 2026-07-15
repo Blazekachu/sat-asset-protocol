@@ -415,3 +415,37 @@ test("GET /v1/sat-for-sat/offers/{id} returns 404 for an unknown id", async () =
     assert.equal(response.status, 404);
   });
 });
+
+test("POST /v1/sat-for-sat/offers/template returns 400 (not 500) for invalid script hex", async () => {
+  await withServer({}, async (baseUrl) => {
+    const body = templateBody();
+    // Non-hex characters in a change script trigger a plain Error deep in the
+    // PSBT/dust build path; the server must translate it to a 400 client error.
+    body.party_a.change_script_pubkey_hex = "zzzznot-hex";
+
+    const response = await fetch(new URL("/v1/sat-for-sat/offers/template", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    assert.equal(response.status, 400);
+  });
+});
+
+test("POST /v1/sat-for-sat/offers/template returns 400 (not 500) for unknown output script type", async () => {
+  await withServer({}, async (baseUrl) => {
+    const body = templateBody();
+    // Valid hex but not a recognised script form -> classifyScript "unknown"
+    // -> dustThresholdForScript throws a plain Error, which must map to 400.
+    body.party_a.change_script_pubkey_hex = "abcdef";
+
+    const response = await fetch(new URL("/v1/sat-for-sat/offers/template", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    assert.equal(response.status, 400);
+  });
+});

@@ -71,12 +71,51 @@ function parseOptionalIntQueryParam(url: URL, name: string): number | undefined 
     return undefined;
   }
 
+  // Require the value to be a run of digits only; Number.parseInt would
+  // otherwise silently accept partial strings like "123abc" and negative
+  // signs where these routes expect a non-negative integer.
+  if (!/^\d+$/.test(text)) {
+    throw new ListingValidationError(
+      `${name} query param must be a non-negative integer`,
+    );
+  }
+
   const value = Number.parseInt(text, 10);
-  if (Number.isNaN(value)) {
-    throw new ListingValidationError(`${name} query param must be an integer`);
+  if (!Number.isSafeInteger(value)) {
+    throw new ListingValidationError(
+      `${name} query param must be a safe integer`,
+    );
   }
 
   return value;
+}
+
+/**
+ * Run a PSBT/script build-or-parse callback and translate the plain `Error`s
+ * that `psbt.ts`/`dust.ts` throw for malformed user input (invalid PSBT magic,
+ * missing unsigned tx, invalid script hex, unknown script type, invalid
+ * outpoint, etc.) into a `PsbtValidationError` so the outer catch maps them to
+ * HTTP 400 instead of 500. Errors already typed as client errors are rethrown
+ * unchanged.
+ */
+function mapPsbtUserInputError<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (error) {
+    if (
+      error instanceof ListingValidationError ||
+      error instanceof PsbtValidationError ||
+      error instanceof DustValidationError
+    ) {
+      throw error;
+    }
+
+    if (error instanceof Error) {
+      throw new PsbtValidationError(error.message);
+    }
+
+    throw error;
+  }
 }
 
 function ensureNonEmptyString(value: unknown, fieldName: string): string {
@@ -488,11 +527,13 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             throw new ListingValidationError("listing outpoint is missing");
           }
 
-          const validation = validateCanonicalTwoBumpFillPsbt(
-            psbtBase64,
-            listing.outpoint,
-            listing.price_sats,
-            dustPolicy,
+          const validation = mapPsbtUserInputError(() =>
+            validateCanonicalTwoBumpFillPsbt(
+              psbtBase64,
+              listing.outpoint as string,
+              listing.price_sats,
+              dustPolicy,
+            ),
           );
 
           writeJson(response, 200, {
@@ -536,7 +577,9 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             throw new ListingValidationError("listing outpoint is missing");
           }
 
-          const parsedListingPsbt = parseListingPsbt(listing.signed_psbt);
+          const parsedListingPsbt = mapPsbtUserInputError(() =>
+            parseListingPsbt(listing.signed_psbt),
+          );
           if (
             parsedListingPsbt.input0WitnessUtxoValue === null ||
             parsedListingPsbt.input0WitnessUtxoScriptPubkeyHex === null
@@ -546,18 +589,21 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             );
           }
 
-          const template = buildBuyerFillTemplatePsbt({
-            sellerOutpoint: listing.outpoint,
-            sellerInputValueSats: parsedListingPsbt.input0WitnessUtxoValue,
-            sellerInputScriptPubkeyHex: parsedListingPsbt.input0WitnessUtxoScriptPubkeyHex,
-            listingPriceSats: listing.price_sats,
-            bumpInputs: bumpInputs.map(toTemplateInput),
-            fundingInputs: fundingInputs.map(toTemplateInput),
-            buyerBumpScriptPubkeyHex,
-            buyerAssetScriptPubkeyHex,
-            buyerChangeScriptPubkeyHex,
-            buyerChangeValueSats,
-          }, dustPolicy);
+          const template = mapPsbtUserInputError(() =>
+            buildBuyerFillTemplatePsbt({
+              sellerOutpoint: listing.outpoint as string,
+              sellerInputValueSats: parsedListingPsbt.input0WitnessUtxoValue as number,
+              sellerInputScriptPubkeyHex:
+                parsedListingPsbt.input0WitnessUtxoScriptPubkeyHex as string,
+              listingPriceSats: listing.price_sats,
+              bumpInputs: bumpInputs.map(toTemplateInput),
+              fundingInputs: fundingInputs.map(toTemplateInput),
+              buyerBumpScriptPubkeyHex,
+              buyerAssetScriptPubkeyHex,
+              buyerChangeScriptPubkeyHex,
+              buyerChangeValueSats,
+            }, dustPolicy),
+          );
 
           writeJson(response, 200, {
             psbt_base64: template.psbtBase64,
@@ -583,14 +629,16 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             "fee_payer_change_value_sats",
           );
 
-          const template = buildSatForSatOfferPsbt({
-            partyA,
-            partyB,
-            feeFundingInput: toTemplateInput(feeFundingInput),
-            feePayerChangeScriptPubkeyHex,
-            feePayerChangeValueSats,
-            dustPolicy,
-          });
+          const template = mapPsbtUserInputError(() =>
+            buildSatForSatOfferPsbt({
+              partyA,
+              partyB,
+              feeFundingInput: toTemplateInput(feeFundingInput),
+              feePayerChangeScriptPubkeyHex,
+              feePayerChangeValueSats,
+              dustPolicy,
+            }),
+          );
 
           writeJson(response, 200, {
             psbt_base64: template.psbtBase64,

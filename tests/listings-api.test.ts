@@ -407,3 +407,172 @@ test("POST /v1/psbt/validate accepts a canonical fill PSBT with dust-safe output
     },
   );
 });
+
+test("POST /v1/psbt/validate returns 400 (not 500) for a malformed PSBT", async () => {
+  const outpoint = "5555555555555555555555555555555555555555555555555555555555555555:0";
+  const priceSats = 1000;
+
+  await withServer(
+    {
+      address: "tb1qexample",
+      confirmations: 5,
+      indexed: true,
+      inscriptions: [],
+      outpoint,
+      runes: {},
+      sat_ranges: [[12345, 12346]],
+      script_pubkey: "",
+      spent: false,
+      transaction: "5555555555555555555555555555555555555555555555555555555555555555",
+      value: 5000,
+    },
+    async (baseUrl) => {
+      const signedPsbt = buildSignedListingPsbt(outpoint, priceSats);
+      const createResponse = await fetch(new URL("/v1/listings", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          asset_type: "sat",
+          sat_number: 12345,
+          outpoint,
+          price_sats: priceSats,
+          seller_address: "tb1qseller000000000000000000000000000000000",
+          signed_psbt: signedPsbt,
+        }),
+      });
+      assert.equal(createResponse.status, 201);
+
+      // "not-a-psbt" lacks the PSBT magic prefix -> parse throws a plain Error.
+      const response = await fetch(new URL("/v1/psbt/validate", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          listing_id: "listing-test-id",
+          psbt_base64: Buffer.from("not-a-psbt").toString("base64"),
+        }),
+      });
+
+      assert.equal(response.status, 400);
+    },
+  );
+});
+
+test("POST /v1/psbt/template returns 400 (not 500) for a bad bump input outpoint", async () => {
+  const outpoint = "6666666666666666666666666666666666666666666666666666666666666666:0";
+  const priceSats = 1000;
+
+  await withServer(
+    {
+      address: "tb1qexample",
+      confirmations: 5,
+      indexed: true,
+      inscriptions: [],
+      outpoint,
+      runes: {},
+      sat_ranges: [[12345, 12346]],
+      script_pubkey: "",
+      spent: false,
+      transaction: "6666666666666666666666666666666666666666666666666666666666666666",
+      value: 5000,
+    },
+    async (baseUrl) => {
+      const signedPsbt = buildSignedListingPsbt(outpoint, priceSats);
+      const createResponse = await fetch(new URL("/v1/listings", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          asset_type: "sat",
+          sat_number: 12345,
+          outpoint,
+          price_sats: priceSats,
+          seller_address: "tb1qseller000000000000000000000000000000000",
+          signed_psbt: signedPsbt,
+        }),
+      });
+      assert.equal(createResponse.status, 201);
+
+      const p2wpkh = (fill: string) => "0014" + fill.repeat(20);
+      // "not-an-outpoint" fails the outpoint format check in buildUnsignedTransaction.
+      const response = await fetch(new URL("/v1/psbt/template", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          listing_id: "listing-test-id",
+          bump_inputs: [
+            { outpoint: "not-an-outpoint", value_sats: 600, script_pubkey_hex: p2wpkh("11") },
+            { outpoint: "b".repeat(64) + ":1", value_sats: 600, script_pubkey_hex: p2wpkh("22") },
+          ],
+          funding_inputs: [
+            { outpoint: "c".repeat(64) + ":2", value_sats: 5000, script_pubkey_hex: p2wpkh("33") },
+          ],
+          buyer_bump_script_pubkey_hex: p2wpkh("44"),
+          buyer_asset_script_pubkey_hex: p2wpkh("55"),
+          buyer_change_script_pubkey_hex: p2wpkh("66"),
+          buyer_change_value_sats: 3000,
+        }),
+      });
+
+      assert.equal(response.status, 400);
+    },
+  );
+});
+
+test("POST /v1/psbt/template returns 400 (not 500) for invalid buyer change script hex", async () => {
+  const outpoint = "7777777777777777777777777777777777777777777777777777777777777777:0";
+  const priceSats = 1000;
+
+  await withServer(
+    {
+      address: "tb1qexample",
+      confirmations: 5,
+      indexed: true,
+      inscriptions: [],
+      outpoint,
+      runes: {},
+      sat_ranges: [[12345, 12346]],
+      script_pubkey: "",
+      spent: false,
+      transaction: "7777777777777777777777777777777777777777777777777777777777777777",
+      value: 5000,
+    },
+    async (baseUrl) => {
+      const signedPsbt = buildSignedListingPsbt(outpoint, priceSats);
+      const createResponse = await fetch(new URL("/v1/listings", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          asset_type: "sat",
+          sat_number: 12345,
+          outpoint,
+          price_sats: priceSats,
+          seller_address: "tb1qseller000000000000000000000000000000000",
+          signed_psbt: signedPsbt,
+        }),
+      });
+      assert.equal(createResponse.status, 201);
+
+      const p2wpkh = (fill: string) => "0014" + fill.repeat(20);
+      const response = await fetch(new URL("/v1/psbt/template", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          listing_id: "listing-test-id",
+          bump_inputs: [
+            { outpoint: "a".repeat(64) + ":0", value_sats: 600, script_pubkey_hex: p2wpkh("11") },
+            { outpoint: "b".repeat(64) + ":1", value_sats: 600, script_pubkey_hex: p2wpkh("22") },
+          ],
+          funding_inputs: [
+            { outpoint: "c".repeat(64) + ":2", value_sats: 5000, script_pubkey_hex: p2wpkh("33") },
+          ],
+          buyer_bump_script_pubkey_hex: p2wpkh("44"),
+          buyer_asset_script_pubkey_hex: p2wpkh("55"),
+          // Odd-length / non-hex change script -> encodeScript throws a plain Error.
+          buyer_change_script_pubkey_hex: "xyz",
+          buyer_change_value_sats: 3000,
+        }),
+      });
+
+      assert.equal(response.status, 400);
+    },
+  );
+});

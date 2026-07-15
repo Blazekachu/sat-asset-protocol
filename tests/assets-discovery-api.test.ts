@@ -230,3 +230,48 @@ test("GET /v1/assets/search?asset_type=range filters by asset type", async () =>
     assert.ok(body.assets.some((a) => a.listing_id === "range-listing"));
   });
 });
+
+test("GET /v1/assets/search rejects a partial-string integer query param (123abc)", async () => {
+  await withServer(seedAll, async (baseUrl) => {
+    const response = await fetch(
+      new URL("/v1/assets/search?sat_number=123abc", baseUrl),
+    );
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as { error: string };
+    assert.match(body.error, /sat_number/);
+  });
+});
+
+test("GET /v1/assets/search rejects a negative integer query param", async () => {
+  await withServer(seedAll, async (baseUrl) => {
+    const response = await fetch(
+      new URL("/v1/assets/search?sat_number=-5", baseUrl),
+    );
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as { error: string };
+    assert.match(body.error, /sat_number/);
+  });
+});
+
+test("GET /v1/assets/search treats an empty integer query param as absent", async () => {
+  await withServer(seedAll, async (baseUrl) => {
+    // Empty sat_number should be ignored (undefined), returning all assets.
+    const response = await fetch(
+      new URL("/v1/assets/search?sat_number=", baseUrl),
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as { assets: Array<{ listing_id: string }> };
+    assert.ok(body.assets.length >= 1);
+  });
+});
+
+test("GET /v1/listings rejects a malformed sat_number query param", async () => {
+  await withServer(seedAll, async (baseUrl) => {
+    const response = await fetch(
+      new URL("/v1/listings?sat_number=99x", baseUrl),
+    );
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as { error: string };
+    assert.match(body.error, /sat_number/);
+  });
+});
