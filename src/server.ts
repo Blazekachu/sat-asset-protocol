@@ -3,12 +3,15 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { createAttestationRecord, verifyAttestationSignature } from "./attestations.ts";
 import { evaluateCollectionPredicate, listCollectionAssetsPage } from "./collections.ts";
+import { loadConfig, type ProtocolConfig } from "./config.ts";
+import { DustValidationError } from "./dust.ts";
 import { ListingService, ListingValidationError, type ListingOrdClient } from "./listing-service.ts";
 import { SqliteListingStore } from "./listing-store.ts";
 import type { CreateListingRequest, ListingStore } from "./listing-types.ts";
 import {
   buildBuyerFillTemplatePsbt,
   parseListingPsbt,
+  PsbtValidationError,
   validateCanonicalTwoBumpFillPsbt,
 } from "./psbt.ts";
 import type { OrdSat, OrdStatus } from "./types.ts";
@@ -31,6 +34,7 @@ export interface AppDependencies {
   verifyOrdClients?: VerifyOrdClient[];
   now?: () => Date;
   createListingId?: () => string;
+  config?: ProtocolConfig;
 }
 
 interface AppInstance {
@@ -126,6 +130,11 @@ export function createApp(dependencies: AppDependencies): AppInstance {
   });
   const verifyOrdClients = dependencies.verifyOrdClients ?? [dependencies.ordClient as VerifyOrdClient];
   const now = dependencies.now ?? (() => new Date());
+  const config = dependencies.config ?? loadConfig();
+  const dustPolicy = {
+    minRelayFeeSatPerVb: config.minRelayFeeSatPerVb,
+    bumpSizeSats: config.bumpSizeSats,
+  };
 
   return {
     handler: async (request, response) => {
@@ -336,6 +345,7 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             psbtBase64,
             listing.outpoint,
             listing.price_sats,
+            dustPolicy,
           );
 
           writeJson(response, 200, {
@@ -408,7 +418,7 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             buyerAssetScriptPubkeyHex,
             buyerChangeScriptPubkeyHex,
             buyerChangeValueSats,
-          });
+          }, dustPolicy);
 
           writeJson(response, 200, {
             psbt_base64: template.psbtBase64,
@@ -422,7 +432,11 @@ export function createApp(dependencies: AppDependencies): AppInstance {
 
         writeJson(response, 404, { error: "Not found" });
       } catch (error) {
-        if (error instanceof ListingValidationError) {
+        if (
+          error instanceof ListingValidationError ||
+          error instanceof PsbtValidationError ||
+          error instanceof DustValidationError
+        ) {
           writeJson(response, 400, { error: error.message });
           return;
         }

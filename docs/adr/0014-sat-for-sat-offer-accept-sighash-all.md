@@ -1,8 +1,9 @@
 # ADR-0014: Sat-for-Sat via Offer/Accept (SIGHASH_ALL)
 
-**Status:** Proposed  
+**Status:** Accepted  
 **Date:** 2026-07-13  
-**Deciders:** Phase 4 v2 spike (research/design only — not yet implemented)  
+**Accepted:** 2026-07-15 — v2 sat-for-sat is being built now per the v2 build directive.  
+**Deciders:** Phase 4 v2 (product decision to build v2 sat-for-sat)  
 **Research:** [PSBT Settlement.md](../PSBT%20Settlement.md) §4, §7 · [../ORD_REVERSE_ENGINEERING/05_sat_asset_notes/02_commerce_vs_ord_offers.md](../../ORD_REVERSE_ENGINEERING/05_sat_asset_notes/02_commerce_vs_ord_offers.md) · [Open Questions.md](../Open%20Questions.md) Q11 · [SAT_FOR_SAT_SPIKE.md](../v2/SAT_FOR_SAT_SPIKE.md)
 
 > **Numbering note:** The task brief requested "ADR-0013". That number is already taken by
@@ -39,9 +40,11 @@ Prior art:
 
 ## Decision
 
-**Propose an offer/accept PSBT construction using `SIGHASH_ALL` on all inputs from both parties as
-the v2 sat-for-sat atomic barter mechanism.** Adoption is **gated on a successful testnet4 spike**
-([SAT_FOR_SAT_SPIKE.md](../v2/SAT_FOR_SAT_SPIKE.md)) and this ADR moving `Proposed → Accepted`.
+**Adopt an offer/accept PSBT construction using `SIGHASH_ALL` on all inputs from both parties as
+the v2 sat-for-sat atomic barter mechanism.** This is **Accepted (2026-07-15)** as the v2 build
+directive; the testnet4 wallet-signability spike ([SAT_FOR_SAT_SPIKE.md](../v2/SAT_FOR_SAT_SPIKE.md))
+is **post-acceptance validation** (see [Compliance → Follow-up validation](#follow-up-validation)),
+not a gate on acceptance.
 
 The mechanism relies on the defining property of `SIGHASH_ALL`: **each signature commits to the
 entire transaction — every input and every output.** Neither party can redirect the other's sat after
@@ -127,16 +130,29 @@ difference, not a limitation to engineer away, and v2 API/UX must model offers a
 - Requires **new v2 API surface** (offer create/accept/verify) distinct from v1 listings.
 
 ### Neutral
-- Does not change v1 behavior; v1 remains sat-for-BTC only until this ADR is Accepted.
+- Does not change v1 behavior; v1 remains sat-for-BTC only. Sat-for-sat is added as the **v2** surface.
 
 ## Compliance
 
-- **This ADR is `Proposed`. Per [ADR-0010](./0010-sat-for-sat-deferred-v2.md) and the Phase 4 brief,
-  no sat-for-sat code, endpoints, price/asset fields, or docs claiming support may merge into the v1 API
-  until this ADR is `Accepted`.** Acceptance requires a passing testnet4 spike (see below).
-- When accepted, this ADR **extends** (does not supersede) ADR-0005 and closes the v2 path opened by ADR-0010.
-- Acceptance gate = the spike's **GO** criteria in [SAT_FOR_SAT_SPIKE.md](../v2/SAT_FOR_SAT_SPIKE.md) §7 are met
-  (notably: ≥2 mainstream wallets sign the mirrored construction, and both sats verify at offset 0 post-broadcast).
+- **This ADR is `Accepted` (2026-07-15).** Acceptance is a **product decision**: v2 sat-for-sat is being
+  built now per the v2 build directive. The mirrored 2-bump construction, its offer/accept endpoints, and the
+  supporting docs may therefore land as the **v2** surface (distinct from the v1 BTC-denominated API).
+- This ADR **extends** (does not supersede) [ADR-0005](./0005-v1-psbt-sat-for-btc-only.md) and **closes the
+  v2 path opened by** [ADR-0010](./0010-sat-for-sat-deferred-v2.md) (which is now superseded in part).
+- v2 sat-for-sat remains a **distinct construction and endpoint set**; the existing v1 offer/accept flow stays
+  **BTC-denominated** and unchanged (see [PROTOCOL_SPEC_v1.md](../PROTOCOL_SPEC_v1.md) §6.6, OPEN-6 resolution).
+
+### Follow-up validation
+
+Acceptance is **not** contingent on the testnet4 wallet-signability spike. That spike — the
+[SAT_FOR_SAT_SPIKE.md](../v2/SAT_FOR_SAT_SPIKE.md) §7 **GO** gate, especially **E3** (foreign-input
+`SIGHASH_ALL` signing across ≥2 mainstream wallets) — is now **post-acceptance validation** to run later,
+tracked as an **open follow-up**. It is **not a merge gate** for this ADR or the v2 build.
+
+- It requires a **persistent `ord` + `bitcoind` (testnet4) host** and real dApp-wallet signing sessions.
+- It **CANNOT run in an ephemeral VM** (no persistent chain state, no interactive wallet UIs).
+- The follow-up records results in the §5 spike results table and, if E3 reveals wallet gaps, opens the
+  documented wallet asks / upstream issues — without blocking the v2 implementation already accepted here.
 
 ## References
 

@@ -1,4 +1,38 @@
+import {
+  assertOutputAboveDust,
+  classifyScript,
+  dustThresholdForScript,
+  DustValidationError,
+} from "./dust.ts";
+
 const PSBT_MAGIC = Buffer.from("70736274ff", "hex");
+
+const DEFAULT_MIN_RELAY_FEE_SAT_PER_VB = 3;
+const DEFAULT_BUMP_SIZE_SATS = 600;
+
+/**
+ * Optional dust policy for the v1 canonical fill PSBT paths. Defaults match the
+ * protocol config defaults (min-relay fee 3 sat/vB, 600-sat bumps) so existing
+ * callers/tests that omit it keep the ADR-0006 canonical behavior. psbt.ts does
+ * NOT read process.env — callers thread these in from ProtocolConfig.
+ */
+export interface DustPolicy {
+  minRelayFeeSatPerVb?: number;
+  bumpSizeSats?: number;
+}
+
+/**
+ * Raised when a PSBT fails a structural or canonical-invariant validation in
+ * {@link validateCanonicalTwoBumpFillPsbt}. Exported so the server can map it to
+ * HTTP 400 without importing listing-service concerns. Dust-specific failures
+ * throw {@link DustValidationError} from ./dust.ts instead.
+ */
+export class PsbtValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PsbtValidationError";
+  }
+}
 
 interface ReaderState {
   readonly buffer: Buffer;
@@ -423,11 +457,17 @@ function encodeWitnessUtxoMap(valueSats: number, scriptPubkeyHex: string): Buffe
   return encodeMapEntry(Buffer.from([0x01]), payload);
 }
 
-export function buildBuyerFillTemplatePsbt(params: BuyerFillTemplateParams): {
+export function buildBuyerFillTemplatePsbt(
+  params: BuyerFillTemplateParams,
+  dustPolicy: DustPolicy = {},
+): {
   psbtBase64: string;
   inputOutpoints: string[];
   outputValues: number[];
 } {
+  const minRelayFeeSatPerVb =
+    dustPolicy.minRelayFeeSatPerVb ?? DEFAULT_MIN_RELAY_FEE_SAT_PER_VB;
+
   if (params.bumpInputs.length !== 2) {
     throw new Error("Canonical template requires exactly 2 bump inputs");
   }
@@ -459,6 +499,10 @@ export function buildBuyerFillTemplatePsbt(params: BuyerFillTemplateParams): {
     { valueSats: params.buyerChangeValueSats, scriptPubkeyHex: params.buyerChangeScriptPubkeyHex },
   ];
 
+  for (const output of outputs) {
+    assertOutputAboveDust(output.scriptPubkeyHex, output.valueSats, minRelayFeeSatPerVb);
+  }
+
   const unsignedTransaction = buildUnsignedTransaction(inputOutpoints, outputs);
 
   const inputMaps: Buffer[] = [
@@ -487,28 +531,46 @@ export function validateCanonicalTwoBumpFillPsbt(
   fillPsbtBase64: string,
   listingOutpoint: string,
   listingPriceSats: number,
+  dustPolicy: DustPolicy = {},
 ): { sellerInputIndex: number; buyerInputCount: number } {
+  const minRelayFeeSatPerVb =
+    dustPolicy.minRelayFeeSatPerVb ?? DEFAULT_MIN_RELAY_FEE_SAT_PER_VB;
+  const bumpSizeSats = dustPolicy.bumpSizeSats ?? DEFAULT_BUMP_SIZE_SATS;
+
   const parsed = parsePsbtUnsignedOnly(fillPsbtBase64);
 
   if (parsed.inputs.length < 4) {
-    throw new Error("Canonical 2-bump fill must include 4+ inputs");
+    throw new PsbtValidationError("Canonical 2-bump fill must include 4+ inputs");
   }
 
   const sellerInputIndex = parsed.inputs.findIndex((input) => input.outpoint === listingOutpoint);
   if (sellerInputIndex !== 2) {
-    throw new Error("Canonical 2-bump fill must place seller input at index 2");
+    throw new PsbtValidationError("Canonical 2-bump fill must place seller input at index 2");
   }
 
   if (parsed.outputs.length < 4) {
-    throw new Error("Canonical 2-bump fill must include 4+ outputs");
+    throw new PsbtValidationError("Canonical 2-bump fill must include 4+ outputs");
   }
 
-  if (parsed.outputs[0]?.value !== 1200) {
-    throw new Error("Output 0 must be canonical 1200-sat bump passthrough");
+  if (parsed.outputs[0]?.value !== 2 * bumpSizeSats) {
+    throw new PsbtValidationError("Output 0 must be canonical 1200-sat bump passthrough");
   }
 
   if (parsed.outputs[2]?.value !== listingPriceSats) {
-    throw new Error("Output 2 must pay listing price to seller");
+    throw new PsbtValidationError("Output 2 must pay listing price to seller");
+  }
+
+  for (const output of parsed.outputs) {
+    if (classifyScript(output.scriptPubkeyHex) === "op_return") {
+      continue;
+    }
+
+    const threshold = dustThresholdForScript(output.scriptPubkeyHex, minRelayFeeSatPerVb);
+    if (output.value < threshold) {
+      throw new DustValidationError(
+        `output value ${output.value} below dust threshold ${threshold}`,
+      );
+    }
   }
 
   const buyerInputCount = parsed.inputs.length - 1;

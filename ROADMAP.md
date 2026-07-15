@@ -82,7 +82,7 @@
 
 ## Phase 4 — v2 Exploration
 
-- [ ] Offer/accept PSBT for sat-for-sat (extends ADR-0005) — [ADR-0014 (Proposed)](docs/adr/0014-sat-for-sat-offer-accept-sighash-all.md), spike: [SAT_FOR_SAT_SPIKE.md](docs/v2/SAT_FOR_SAT_SPIKE.md)
+- [x] Offer/accept PSBT for sat-for-sat (extends ADR-0005) — **in progress / building v2** — [ADR-0014 (Accepted)](docs/adr/0014-sat-for-sat-offer-accept-sighash-all.md); testnet4 wallet-signability spike is post-acceptance follow-up: [SAT_FOR_SAT_SPIKE.md](docs/v2/SAT_FOR_SAT_SPIKE.md) §7 GO gate
 - [ ] On-chain listing invalidation option (Gamma-style)
 - [ ] OPI-style integrity hash for listing DB (see Indexer Landscape IL1)
 

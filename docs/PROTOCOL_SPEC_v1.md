@@ -47,7 +47,8 @@ attestation-based collections (ADR-0008), and (f) a multi-node ord verification 
 The protocol sits **above** `ord` and Bitcoin Core and reuses them as read-only truth sources; it
 does not reimplement sat indexing (ADR-0002), does not store inscription payloads (ADR-0003), and does
 not attempt to replace Ordinals, marketplaces, or wallets (ADR-0004). **Sat-for-sat atomic barter is
-explicitly out of scope for v1** and deferred to v2 (ADR-0005, ADR-0010).
+out of scope for the v1 BTC-denominated surface** (ADR-0005, ADR-0010) and is delivered as a **v2**
+addition via the mirrored 2-bump `SIGHASH_ALL` construction (§6.6, [ADR-0014](./adr/0014-sat-for-sat-offer-accept-sighash-all.md), Accepted 2026-07-15).
 
 ---
 
@@ -67,17 +68,22 @@ Per **ADR-0005** (*v1 PSBT — sat-for-BTC only*), v1 standardizes **BTC-denomin
 All prices and bids in v1 are denominated in **BTC sats only** (ADR-0005 Compliance: `price_sats` is
 a BTC amount).
 
-### 2.2 Explicitly deferred to v2 (normative)
+### 2.2 v2 additions and remaining deferrals (normative)
 
-Per **ADR-0005** and **ADR-0010** (*sat-for-sat deferred to v2*):
+- **Sat-for-sat atomic barter — now v2, implemented** per **[ADR-0014](./adr/0014-sat-for-sat-offer-accept-sighash-all.md)**
+  (*Accepted 2026-07-15*), which **closes the v2 path opened by ADR-0010** (ADR-0010 is superseded in part).
+  The v1 `SIGHASH_SINGLE | ANYONECANPAY` listing model commits to a payment **amount**, not a specific sat
+  ordinal, so it cannot bind sat↔sat; v2 instead uses the mirrored 2-bump `SIGHASH_ALL` construction (**§6.6**)
+  over the distinct `/v1/sat-for-sat/offers` namespace (**§9.2**). The v1 BTC-denominated API (**§2.1**, §6.3)
+  is unchanged and **MUST NOT** be conflated with sat-for-sat (OPEN-6 resolution).
 
-- **Sat-for-sat atomic barter** — the `SIGHASH_SINGLE | ANYONECANPAY` listing model commits to a
-  payment **amount**, not a specific sat ordinal, so it cannot bind sat↔sat. v1 APIs and documentation
-  **MUST NOT** imply sat-for-sat is supported (ADR-0010 Compliance).
+| Trade type | Status | Mechanism |
+|------------|--------|-----------|
+| **Sat → Sat (atomic barter)** | **v2 — implemented** | Mirrored 2-bump `SIGHASH_ALL` offer/accept (§6.6, ADR-0014) |
+
+Still **deferred** to a future version (not yet specified here):
+
 - Sat-for-inscription barter, HTLC/DLC swaps, `SIGHASH_ANYPREVOUT`-based flows.
-
-The v2 path begins with an offer/accept PSBT prototype and will require a new ADR that supersedes or
-extends ADR-0005 (ADR-0010 Compliance).
 
 ### 2.3 Architectural boundary (normative)
 
@@ -292,9 +298,10 @@ Outputs:
 ```
 
 - No bump UTXOs required; buyer signs first, seller countersigns via `/v1/offers/{id}/accept`.
-- `bid_sats` is a **BTC** amount. This flow is **not** sat-for-sat in v1 (ADR-0005, ADR-0010).
-- ⚠ The same offer/accept construction is the **candidate** basis for v2 sat-for-sat; it **MUST NOT**
-  be exposed as such in v1 (ADR-0010).
+- `bid_sats` is a **BTC** amount. This v1 flow is **not** sat-for-sat and stays BTC-denominated (ADR-0005, ADR-0010).
+- The v2 sat-for-sat swap uses a **distinct** mirrored 2-bump `SIGHASH_ALL` construction on a **separate**
+  endpoint namespace — see **§6.6** and `/v1/sat-for-sat/offers` (§9.2, ADR-0014). The two **MUST NOT** be
+  conflated (OPEN-6 resolution).
 
 ### 6.4 Offset-0 precondition (normative, ADR-0007)
 
@@ -320,6 +327,58 @@ Per [PSBT Settlement.md §6.3](./PSBT%20Settlement.md) and ADR-0006:
 
 Test vectors live in `tests/psbt/` when implemented (ADR-0006 Compliance) — deferred to Phase 1
 "PSBT test vectors" task (ROADMAP Phase 1), not this document.
+
+### 6.6 Sat-for-sat offer/accept (v2, ADR-0014, normative)
+
+Per **[ADR-0014](./adr/0014-sat-for-sat-offer-accept-sighash-all.md)** (*Accepted 2026-07-15*), v2 adds
+**atomic sat-for-sat barter** — swapping two **specific sats** with no custody and no consensus change.
+This is a **distinct construction and endpoint set** from the v1 BTC-denominated offer/accept flow (§6.3);
+v1 offers remain BTC-denominated (see **⚠ OPEN-6**, now resolved).
+
+The v1 `SIGHASH_SINGLE | ANYONECANPAY` listing model commits to a payment **amount**, not a sat identity,
+so it cannot bind sat↔sat. v2 instead has **both parties sign every input with `SIGHASH_ALL`** so each
+signature commits to the **entire transaction** (every input, every output); any edit invalidates all
+signatures, making the swap atomic and tamper-proof.
+
+**Mirrored 2-bump construction.** Party **A** offers sat **X** (at offset 0 of `A_asset`) for party **B**'s
+sat **Y** (at offset 0 of `B_asset`). A bump input precedes each asset input so ordinal-theory FIFO lands
+each recipient's acquired sat at **offset 0** of its ordinals output:
+
+```
+Inputs (order matters — defines the FIFO sat stream):
+  [0] A_bump       (~600 sats)         A signs SIGHASH_ALL
+  [1] A_asset      (postage p_A, X@0)  A signs SIGHASH_ALL
+  [2] B_bump       (~600 sats)         B signs SIGHASH_ALL
+  [3] B_asset      (postage p_B, Y@0)  B signs SIGHASH_ALL
+  [4] fee_funding  (F)                 fee payer signs SIGHASH_ALL
+
+Outputs (order matters — consumes the FIFO stream in sequence):
+  [0] A_change     : 600               (consumes A_bump; clears the stream head)
+  [1] B_ordinals   : p_A               (= A_asset postage; sat X lands at offset 0) → B receives X
+  [2] B_change     : 600               (consumes B_bump)
+  [3] A_ordinals   : p_B               (= B_asset postage; sat Y lands at offset 0) → A receives Y
+  [4] fee_payer_change : F - fee       (funding change; fee = network fee)
+```
+
+**Normative rules:**
+
+1. **All five inputs MUST be signed `SIGHASH_ALL`.** Taproot key-path inputs MAY use `SIGHASH_DEFAULT`
+   (`0x00`), which is treated as **`SIGHASH_ALL`-equivalent**. No input may be signed with any other
+   sighash flag; a PSBT with any non-`ALL` (non-`DEFAULT`) sighash **MUST be rejected**.
+2. **Offset-0 precondition on BOTH assets** (extends ADR-0007 symmetrically): sat X **MUST** be at offset 0
+   of `A_asset` and sat Y **MUST** be at offset 0 of `B_asset` (verified via ord); otherwise **reject**.
+3. **Input/output ordering is load-bearing** for FIFO sat preservation and **MUST** match the layout above;
+   non-canonical ordering **MUST be rejected**.
+4. **Dust on all outputs:** every output **MUST** meet the per-script-type dust threshold
+   ([ADR-0015](./adr/0015-dust-and-canonical-postage.md)).
+5. **Non-custodial:** the coordinating service **MUST NOT** hold keys; it only relays partially-signed PSBTs.
+6. **Point-to-point, not an orderbook:** because `SIGHASH_ALL` requires each signer to commit to inputs it
+   does **not** own, both parties' outpoints must be known at build time. A sat-for-sat offer is therefore an
+   inherently **targeted, negotiated, expiring bid** — **not** an open, anyone-can-fill listing (ADR-0014).
+
+**Flow:** A builds the full PSBT, signs `[0]`, `[1]` (and `[4]` if A funds fees), and sends it to B; B
+independently verifies the outputs route X→B@0 and Y→A@0 with correct addresses/amounts, signs `[2]`, `[3]`,
+finalizes, and broadcasts.
 
 ---
 
@@ -430,6 +489,7 @@ it **MUST NOT** recompute FIFO and **MUST** delegate sat location to ord (ADR-00
 |----------|--------|-------------|
 | `/v1/assets/{sat_number}` | GET | Resolve sat → custody + listing status |
 | `/v1/assets/range/{start}/{end}` | GET | Range membership + overlapping listings |
+| `/v1/assets/search` | GET | Search/filter assets (rarity, listing status, collection membership) |
 | `/v1/collections/{id}/assets` | GET | Sats matching predicate (paginated; bounded scan stub permitted in Phase 2b) |
 | `/v1/collections/{id}/verify/{sat_number}` | GET | Membership test (`verified` / `attested`) |
 
@@ -440,8 +500,19 @@ it **MUST NOT** recompute FIFO and **MUST** delegate sat location to ord (ADR-00
 | `/v1/listings` | GET | Query open listings |
 | `/v1/listings/{id}` | DELETE | Cancel (revoke / on-chain spend) |
 | `/v1/listings/{id}/fill` | POST | Buyer submits 2-bump completion PSBT (§6.2) |
-| `/v1/offers` | POST | Buyer-initiated BTC bid (§6.3) |
-| `/v1/offers/{id}/accept` | POST | Seller countersigns |
+| `/v1/offers` | POST | Buyer-initiated **BTC** bid (§6.3) — stays BTC-denominated |
+| `/v1/offers/{id}/accept` | POST | Seller countersigns the BTC bid |
+
+**v2 sat-for-sat offers (ADR-0014, §6.6).** A **distinct namespace** — `/v1/sat-for-sat/offers` — carries the
+sat-for-sat construction. This is **separate** from the `/v1/offers` BTC-bid route above, which remains
+BTC-denominated and unchanged (OPEN-6 resolution):
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/sat-for-sat/offers/template` | POST | Generate the mirrored 2-bump sat-for-sat PSBT template (§6.6) |
+| `/v1/sat-for-sat/offers` | POST | A creates a sat-for-sat offer (X-for-Y), partially signed `SIGHASH_ALL` |
+| `/v1/sat-for-sat/offers/{id}` | GET | Fetch a sat-for-sat offer (PSBT + X/Y sat metadata, status) |
+| `/v1/sat-for-sat/offers/{id}/accept` | POST | B verifies + countersigns `[2]`,`[3]`, finalizes, broadcasts |
 
 ### 9.3 Settlement & verification
 | Endpoint | Method | Description |
@@ -469,7 +540,8 @@ and [Minimal Schema.md §9](./Minimal%20Schema.md).
 
 | Excluded | Reason | ADR |
 |----------|--------|-----|
-| **Sat-for-sat / sat-for-inscription barter** | `SIGHASH_SINGLE` cannot bind a sat identity | ADR-0005, ADR-0010 |
+| **Sat-for-inscription barter** | Not yet specified; `SIGHASH_SINGLE` cannot bind a sat identity | ADR-0005, ADR-0010 |
+| ~~Sat-for-sat barter~~ **→ now v2, implemented** | `SIGHASH_SINGLE` cannot bind a sat identity, but the v2 mirrored 2-bump `SIGHASH_ALL` construction can (§6.6) | **ADR-0014** (closes ADR-0010) |
 | **Custom / parallel sat indexer** | Delegated to ord; no `sat_ranges` table in protocol DB | ADR-0002, ADR-0011 |
 | **Inscription payload bytes / media hosting / CDN** | Metadata-only; no `content`/`media_url`/blob columns; no `/content/*` | ADR-0003 |
 | **Reimplementing FIFO numbering / naming / rarity** | Owned by ord / `crates/ordinals` | ADR-0001, ADR-0004 |
@@ -513,10 +585,11 @@ implementation.
 - **RESOLVED (ADR-0013) — Attestation signature scheme.** v1 uses Ed25519 with base64 SPKI DER
   public keys and base64 signatures over canonical UTF-8 JSON payload bytes.
 
-- **⚠ OPEN-6 — Offer/accept dual-use (v1 bid vs v2 barter).** The §6.3 offer/accept flow is both a v1
-  BTC-bid mechanism ([Minimal Schema.md §5](./Minimal%20Schema.md)) and the *candidate* v2 sat-for-sat
-  mechanism ([PSBT Settlement.md §4/§7](./PSBT%20Settlement.md), ADR-0010). *Action:* keep v1 offers
-  strictly BTC-denominated; ensure API/marketing never conflate them (ADR-0005/0010 Compliance).
+- **✅ OPEN-6 — Offer/accept dual-use (v1 bid vs v2 barter) — Resolved — ADR-0014.** The two flows are now
+  **distinct constructions on distinct endpoint sets**: the v1 §6.3 offer/accept flow stays **BTC-denominated**
+  on `/v1/offers`, while v2 sat-for-sat uses the mirrored 2-bump `SIGHASH_ALL` construction (§6.6) on the
+  separate `/v1/sat-for-sat/offers` namespace (§9.2). They **MUST NOT** be conflated in API or marketing
+  (ADR-0005/0010/0014 Compliance).
 
 - **⚠ OPEN-7 — Cross-wallet `sighashTypes` support.** [PSBT Settlement.md §8/§10](./PSBT%20Settlement.md)
   flags Sats Connect (Xverse) per-input `sighashTypes` consistency as **UNKNOWN** (Open Questions Q10).
@@ -550,8 +623,9 @@ pass on testnet4 (ROADMAP Phase 1 gate).
 | 0007 | Offset-0 precondition | §6.1, §6.4, §6.5 |
 | 0008 | Collection predicates + attestations | §7 |
 | 0009 | Multi-node ord verification | §8 |
-| 0010 | Sat-for-sat deferred to v2 | §2.2, §6.3, §10, ⚠ OPEN-6 |
+| 0010 | Sat-for-sat deferred to v2 (superseded in part by 0014) | §2.2, §6.3, §10, ✅ OPEN-6 |
 | 0011 | Ord architectural audit | §3 (pin), §8.3 |
+| 0014 | Sat-for-sat via offer/accept (SIGHASH_ALL) | §2.2, §6.6, §9.1, §9.2, §10, ✅ OPEN-6 |
 
 ---
 
