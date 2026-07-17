@@ -185,6 +185,39 @@ const OFFER_COLUMNS = `
   bid_remaining_quantity
 `;
 
+// Single source of truth for the offers INSERT: column list + matching value
+// placeholders. Used by insertOffer and the transactional counter/bid-fill
+// paths so the 25-column list is never duplicated (and can never drift).
+const INSERT_OFFER_SQL = `
+  INSERT INTO offers (
+    offer_id,
+    offerer_sat_number,
+    offerer_asset_outpoint,
+    taker_sat_number,
+    taker_asset_outpoint,
+    offer_psbt,
+    accept_psbt,
+    status,
+    created_at,
+    expires_at,
+    offer_kind,
+    negotiation_id,
+    parent_offer_id,
+    counter_index,
+    supersedes,
+    nonce,
+    give_assets_json,
+    want_spec_json,
+    taker_assets_json,
+    taker_build_json,
+    settlement_txid,
+    bid_target_quantity,
+    bid_total_btc_sats,
+    bid_remaining_quantity,
+    bid_want_spec_json
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`;
+
 export class SqliteListingStore implements ListingStore {
   readonly #database: DatabaseSync;
 
@@ -632,38 +665,31 @@ export class SqliteListingStore implements ListingStore {
       });
   }
 
+  // Run `body` inside a single BEGIN IMMEDIATE transaction, committing on
+  // success and rolling back on any thrown error. node:sqlite's DatabaseSync
+  // has no db.transaction() helper (verified typeof db.transaction ===
+  // "undefined"), so this explicit wrapper is the shared primitive for every
+  // multi-statement CAS below.
+  #transaction<T>(body: () => T): T {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = body();
+      this.#database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // Insert one offers row from an OfferRecord (shared by insertOffer and the
+  // transactional counter/bid-fill paths).
+  #insertOfferRow(record: OfferRecord): void {
+    this.#database.prepare(INSERT_OFFER_SQL).run(...this.#offerInsertValues(record));
+  }
+
   insertOffer(record: OfferRecord): void {
-    this.#database
-      .prepare(`
-        INSERT INTO offers (
-          offer_id,
-          offerer_sat_number,
-          offerer_asset_outpoint,
-          taker_sat_number,
-          taker_asset_outpoint,
-          offer_psbt,
-          accept_psbt,
-          status,
-          created_at,
-          expires_at,
-          offer_kind,
-          negotiation_id,
-          parent_offer_id,
-          counter_index,
-          supersedes,
-          nonce,
-          give_assets_json,
-          want_spec_json,
-          taker_assets_json,
-          taker_build_json,
-          settlement_txid,
-          bid_target_quantity,
-          bid_total_btc_sats,
-          bid_remaining_quantity,
-          bid_want_spec_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(...this.#offerInsertValues(record));
+    this.#insertOfferRow(record);
   }
 
   #offerInsertValues(record: OfferRecord): Array<string | number | null> {
@@ -821,47 +847,14 @@ export class SqliteListingStore implements ListingStore {
   }
 
   // Atomically insert the child round and CAS the parent open -> countered.
-  // DatabaseSync (node:sqlite) has no db.transaction() helper (verified
-  // typeof db.transaction === "undefined"), so use explicit BEGIN/COMMIT/
-  // ROLLBACK. If the parent CAS changes !== 1, the child is never orphaned.
+  // If the parent CAS changes !== 1, the child is never orphaned (rolled back).
   supersedeWithCounter(
     parentId: string,
     parentNonce: string,
     childRow: OfferRecord,
   ): OfferRecord {
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
-      this.#database
-        .prepare(`
-          INSERT INTO offers (
-            offer_id,
-            offerer_sat_number,
-            offerer_asset_outpoint,
-            taker_sat_number,
-            taker_asset_outpoint,
-            offer_psbt,
-            accept_psbt,
-            status,
-            created_at,
-            expires_at,
-            offer_kind,
-            negotiation_id,
-            parent_offer_id,
-            counter_index,
-            supersedes,
-            nonce,
-            give_assets_json,
-            want_spec_json,
-            taker_assets_json,
-            taker_build_json,
-            settlement_txid,
-            bid_target_quantity,
-            bid_total_btc_sats,
-            bid_remaining_quantity,
-            bid_want_spec_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `)
-        .run(...this.#offerInsertValues(childRow));
+    this.#transaction(() => {
+      this.#insertOfferRow(childRow);
 
       const result = this.#database
         .prepare(`
@@ -874,12 +867,7 @@ export class SqliteListingStore implements ListingStore {
       if (Number(result.changes) !== 1) {
         throw new Error("parent offer is not open under the supplied nonce");
       }
-
-      this.#database.exec("COMMIT");
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+    });
 
     const child = this.getOffer(childRow.offer_id);
     if (!child) {
@@ -1005,8 +993,7 @@ export class SqliteListingStore implements ListingStore {
     filledDelta: number,
     filledAssetRef: OfferAssetRef,
   ): OfferRecord {
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
+    this.#transaction(() => {
       // (1) re-read the bid, assert open + matching nonce.
       const bid = this.getOffer(bidId);
       if (!bid) {
@@ -1042,37 +1029,7 @@ export class SqliteListingStore implements ListingStore {
 
       // (4) insert the child settlement offer + transition the pending_build
       // ledger row to reserved.
-      this.#database
-        .prepare(`
-          INSERT INTO offers (
-            offer_id,
-            offerer_sat_number,
-            offerer_asset_outpoint,
-            taker_sat_number,
-            taker_asset_outpoint,
-            offer_psbt,
-            accept_psbt,
-            status,
-            created_at,
-            expires_at,
-            offer_kind,
-            negotiation_id,
-            parent_offer_id,
-            counter_index,
-            supersedes,
-            nonce,
-            give_assets_json,
-            want_spec_json,
-            taker_assets_json,
-            taker_build_json,
-            settlement_txid,
-            bid_target_quantity,
-            bid_total_btc_sats,
-            bid_remaining_quantity,
-            bid_want_spec_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `)
-        .run(...this.#offerInsertValues(fillRow));
+      this.#insertOfferRow(fillRow);
 
       const fillTransition = this.#database
         .prepare(`
@@ -1101,12 +1058,7 @@ export class SqliteListingStore implements ListingStore {
       if (Number(casResult.changes) !== 1) {
         throw new Error("bid remainder CAS failed (stale nonce or over-commit)");
       }
-
-      this.#database.exec("COMMIT");
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+    });
 
     const updated = this.getOffer(bidId);
     if (!updated) {
@@ -1116,8 +1068,7 @@ export class SqliteListingStore implements ListingStore {
   }
 
   settleBidFill(bidId: string, fillId: string, txid: string, nonce: string): OfferRecord {
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
+    this.#transaction(() => {
       const bid = this.getOffer(bidId);
       if (!bid || bid.offer_kind !== "bid") {
         throw new Error("bid not found");
@@ -1149,12 +1100,7 @@ export class SqliteListingStore implements ListingStore {
           WHERE offer_id = ?
         `)
         .run(txid, fill.fill_offer_id);
-
-      this.#database.exec("COMMIT");
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+    });
 
     const updated = this.getOffer(bidId);
     if (!updated) {
@@ -1164,8 +1110,7 @@ export class SqliteListingStore implements ListingStore {
   }
 
   releaseBidFill(bidId: string, fillId: string, nonce: string): OfferRecord {
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
+    this.#transaction(() => {
       const bid = this.getOffer(bidId);
       if (!bid || bid.offer_kind !== "bid") {
         throw new Error("bid not found");
@@ -1206,12 +1151,7 @@ export class SqliteListingStore implements ListingStore {
       this.#database
         .prepare(`UPDATE offers SET status = 'cancelled' WHERE offer_id = ?`)
         .run(fill.fill_offer_id);
-
-      this.#database.exec("COMMIT");
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+    });
 
     const updated = this.getOffer(bidId);
     if (!updated) {
