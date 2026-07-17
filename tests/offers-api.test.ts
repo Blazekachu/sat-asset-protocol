@@ -449,3 +449,70 @@ test("POST /v1/sat-for-sat/offers/template returns 400 (not 500) for unknown out
     assert.equal(response.status, 400);
   });
 });
+
+// --- negotiation-lifecycle cells N2 (expiry) + N4 (cancellation) ----------
+// The legacy single-shot offer is a concrete round whose nonce == offer_id, so
+// it exercises the same accept / cancel / lazy-expiry CAS paths as a negotiated
+// round. withServer's clock is fixed at 2026-07-15T00:00:00.000Z.
+
+test("[N2] per-round expiry: accepting a round whose expires_at is in the past is rejected (400)", async () => {
+  await withServer(offsetZeroOrdOutputs(), async (baseUrl) => {
+    // Create an offer that already expired relative to the fixed clock.
+    const createRes = await fetch(new URL("/v1/sat-for-sat/offers", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...createBody(buildOfferPsbt()),
+        expires_at: "2026-07-14T00:00:00.000Z",
+      }),
+    });
+    assert.equal(createRes.status, 201);
+
+    const acceptRes = await fetch(
+      new URL("/v1/sat-for-sat/offers/offer-test-id/accept", baseUrl),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ accept_psbt: buildAcceptPsbt(), nonce: "offer-test-id" }),
+      },
+    );
+    assert.equal(acceptRes.status, 400);
+    const body = (await acceptRes.json()) as { error: string };
+    assert.match(body.error, /not open|expired/i);
+  });
+});
+
+test("[N4] cancellation: a cancelled round cannot be accepted (400)", async () => {
+  await withServer(offsetZeroOrdOutputs(), async (baseUrl) => {
+    const createRes = await fetch(new URL("/v1/sat-for-sat/offers", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(createBody(buildOfferPsbt())),
+    });
+    assert.equal(createRes.status, 201);
+
+    // Cancel the open round (legacy nonce == offer_id).
+    const cancelRes = await fetch(
+      new URL("/v1/sat-for-sat/offers/offer-test-id/cancel", baseUrl),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ nonce: "offer-test-id" }),
+      },
+    );
+    assert.equal(cancelRes.status, 200);
+
+    // Accepting the cancelled round is now rejected.
+    const acceptRes = await fetch(
+      new URL("/v1/sat-for-sat/offers/offer-test-id/accept", baseUrl),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ accept_psbt: buildAcceptPsbt(), nonce: "offer-test-id" }),
+      },
+    );
+    assert.equal(acceptRes.status, 400);
+    const body = (await acceptRes.json()) as { error: string };
+    assert.match(body.error, /not open|cancelled/i);
+  });
+});

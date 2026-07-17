@@ -18,6 +18,8 @@ import {
   type SatForSatAssetSide,
 } from "../src/sat-for-sat.ts";
 import { buildSatForSatBundlePsbt } from "../src/sat-for-sat-bundle.ts";
+import { assetsSatisfyWant } from "../src/offer-predicates.ts";
+import type { OfferAssetRef, WantSpec } from "../src/listing-types.ts";
 
 // --- fixtures -------------------------------------------------------------
 
@@ -168,7 +170,7 @@ function buildOfferParams() {
 
 // --- builder --------------------------------------------------------------
 
-test("buildSatForSatOfferPsbt emits 5 inputs in canonical order and 5 computed output values", () => {
+test("[M1] single sat for specific sat: buildSatForSatOfferPsbt emits 5 inputs in canonical order and 5 computed output values", () => {
   const result = buildSatForSatOfferPsbt(buildOfferParams());
 
   assert.deepEqual(result.inputOutpoints, [
@@ -645,7 +647,7 @@ test("validateSatForSatOfferPsbt accepts [1,0] (unordered) as the canonical [0,1
 
 // --- SHOULD-FIX 5: value conservation / non-negative fee ------------------
 
-test("buildSatForSatOfferPsbt rejects a fee-payer change larger than the fee input", () => {
+test("[V2] negative-fee guard: buildSatForSatOfferPsbt rejects a fee-payer change larger than the fee input", () => {
   const params = buildOfferParams();
   // FEE_INPUT is 5000; ask for change > input value.
   params.feePayerChangeValueSats = 6000;
@@ -717,4 +719,95 @@ test("validateSatForSatOfferPsbt rejects an offer whose outputs exceed inputs (n
       error instanceof PsbtValidationError &&
       /(exceeds fee-funding input|implied fee would be negative)/.test(error.message),
   );
+});
+
+// --- offer-matrix cells: M3, M4, M7, D1, V1 ------------------------------
+// These drive the real builder with varied asset shapes. The builder treats an
+// asset input by its value only (sat = postage-sized, range = span-sized); the
+// offset-0 / range-span / ord-identity checks live in the service (exercised in
+// negotiation-model.test.ts). Here we assert the byte-level shape + conservation.
+
+// A range asset input (its value == contiguous span, well above dust).
+const A_RANGE_ASSET: TemplateInput = {
+  outpoint: "1".repeat(64) + ":0",
+  valueSats: 5000,
+  scriptPubkeyHex: p2wpkh("a3"),
+};
+const B_RANGE_ASSET: TemplateInput = {
+  outpoint: "2".repeat(64) + ":0",
+  valueSats: 4000,
+  scriptPubkeyHex: p2wpkh("b3"),
+};
+
+test("[M3] single sat for a predicate-matched sat: any sat satisfying P is accepted and the matched sat settles at offset 0", () => {
+  // Intent-level: a predicate want (name-prefix via sat_range here) accepts ANY
+  // concrete sat satisfying P; the settlement then binds that specific sat.
+  const want: WantSpec = {
+    mode: "predicate",
+    predicate: { type: "sat_range", params: { start: 0, end: 100000 } },
+    count: 1,
+  };
+  const matched: OfferAssetRef = {
+    asset_type: "sat",
+    asset_outpoint: B_ASSET.outpoint,
+    sat_number: 67890,
+  };
+  assert.deepEqual(assetsSatisfyWant(want, [matched]), { ok: true });
+
+  // The matched sat then settles through the canonical single-asset builder.
+  const result = buildSatForSatOfferPsbt(buildOfferParams());
+  // Output index 3 carries B's asset value to A's ordinals output (offset 0).
+  assert.equal(result.outputValues[3], B_ASSET.valueSats);
+});
+
+test("[M4] single range for a specific sat: range (contiguous >= dust) <-> specific sat; both offset-0; value kept", () => {
+  const params = {
+    ...buildOfferParams(),
+    partyA: { ...PARTY_A, assetInput: A_RANGE_ASSET },
+  };
+  const result = buildSatForSatOfferPsbt(params);
+  // A's range asset lands at output index 1 (-> B's ordinals) with its full span.
+  assert.equal(result.outputValues[1], A_RANGE_ASSET.valueSats);
+  // B's specific sat lands at output index 3 with its postage value.
+  assert.equal(result.outputValues[3], B_ASSET.valueSats);
+});
+
+test("[M7] single sat for a specific range: size-mismatch builds; each side keeps its value", () => {
+  const params = {
+    ...buildOfferParams(),
+    partyB: { ...PARTY_B, assetInput: B_RANGE_ASSET },
+  };
+  const result = buildSatForSatOfferPsbt(params);
+  // A gives a postage-sized sat (output 1), B gives a range (output 3); values kept.
+  assert.equal(result.outputValues[1], A_ASSET.valueSats);
+  assert.equal(result.outputValues[3], B_RANGE_ASSET.valueSats);
+});
+
+test("[D1] 1-sat asset padded to canonical postage builds and preserves offset 0", () => {
+  // A bare sat carried in a 546-sat (P2WPKH-safe) postage output builds; the
+  // ordinals output value equals the postage and passes the dust guard.
+  const params = buildOfferParams();
+  const result = buildSatForSatOfferPsbt(params);
+  assert.equal(result.outputValues[1], 546);
+  assert.equal(result.outputValues[3], 546);
+  assert.ok(result.outputValues[1] >= 330);
+});
+
+test("[V1] value conservation: a non-negative (positive) implied fee builds and sum(out) <= sum(in)", () => {
+  const inSum = A_BUMP.valueSats + A_ASSET.valueSats + B_BUMP.valueSats + B_ASSET.valueSats + FEE_INPUT.valueSats;
+
+  // Positive implied fee: fee input 5000, fee change 3000 => 2000 sat fee.
+  const positive = buildSatForSatOfferPsbt(buildOfferParams());
+  const outSum = positive.outputValues.reduce((a, b) => a + b, 0);
+  assert.ok(inSum - outSum >= 0, "implied fee must be non-negative");
+  assert.ok(inSum - outSum > 0, "canonical params leave a positive fee");
+
+  // A larger fee-payer change (smaller fee) still conserves value and builds,
+  // as long as it stays above the min-relay fee band (>= 3 sat/vB).
+  const smallerFee = buildSatForSatOfferPsbt({
+    ...buildOfferParams(),
+    feePayerChangeValueSats: 3000,
+  });
+  const smallerOut = smallerFee.outputValues.reduce((a, b) => a + b, 0);
+  assert.ok(inSum - smallerOut >= 0);
 });

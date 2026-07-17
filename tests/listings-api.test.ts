@@ -187,7 +187,7 @@ async function withServer(
   }
 }
 
-test("POST /v1/listings accepts a valid offset-0 listing and GET /v1/listings returns it", async () => {
+test("[M2][M5] POST /v1/listings accepts a valid offset-0 listing and GET /v1/listings returns it", async () => {
   const outpoint = "1111111111111111111111111111111111111111111111111111111111111111:0";
 
   await withServer(
@@ -344,7 +344,7 @@ test("POST /v1/psbt/validate rejects a fill PSBT with a sub-dust output", async 
   );
 });
 
-test("POST /v1/psbt/validate accepts a canonical fill PSBT with dust-safe outputs", async () => {
+test("[M2] POST /v1/psbt/validate accepts a canonical fill PSBT with dust-safe outputs", async () => {
   const outpoint = "4444444444444444444444444444444444444444444444444444444444444444:0";
   const priceSats = 1000;
 

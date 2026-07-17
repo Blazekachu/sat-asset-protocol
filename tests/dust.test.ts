@@ -48,7 +48,27 @@ test("OP_RETURN has zero threshold and assertOutputAboveDust never throws for it
   assert.doesNotThrow(() => assertOutputAboveDust(OP_RETURN, 1));
 });
 
-test("assertOutputAboveDust boundary: value == threshold passes, threshold-1 throws", () => {
+test("[D3] assertOutputAboveDust boundary: value == threshold passes, threshold-1 throws", () => {
+  // P2TR 330, P2WPKH 294, P2PKH 546, P2SH 540 — value==threshold passes, -1 throws.
+  const boundaries: Array<[string, number, string]> = [
+    [P2TR, 330, "p2tr"],
+    [P2WPKH, 294, "p2wpkh"],
+    [P2PKH, 546, "p2pkh"],
+    [P2SH, 540, "p2sh"],
+  ];
+  for (const [script, threshold, label] of boundaries) {
+    assert.doesNotThrow(() => assertOutputAboveDust(script, threshold), `${label} == threshold`);
+    assert.throws(
+      () => assertOutputAboveDust(script, threshold - 1),
+      (err: unknown) => {
+        assert.ok(err instanceof DustValidationError);
+        assert.match((err as Error).message, new RegExp(`below dust threshold ${threshold} for ${label}`));
+        return true;
+      },
+      `${label} threshold-1`,
+    );
+  }
+
   assert.doesNotThrow(() => assertOutputAboveDust(P2TR, 330));
 
   assert.throws(
