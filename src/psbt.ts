@@ -3,6 +3,7 @@ import {
   classifyScript,
   dustThresholdForScript,
   DustValidationError,
+  SCRIPT_DUST_BYTES,
 } from "./dust.ts";
 
 export const PSBT_MAGIC = Buffer.from("70736274ff", "hex");
@@ -19,6 +20,13 @@ const DEFAULT_BUMP_SIZE_SATS = 600;
 export interface DustPolicy {
   minRelayFeeSatPerVb?: number;
   bumpSizeSats?: number;
+  /**
+   * Opt-in upper bound on the implied fee rate (sat/vB). When set, a builder or
+   * validator that supports the fee-band check also requires
+   * `fee / vsize <= maxFeeRateSatPerVb`. Left `undefined` by legacy callers so
+   * existing PSBTs that validate today are never newly rejected (RD6).
+   */
+  maxFeeRateSatPerVb?: number;
 }
 
 /**
@@ -565,6 +573,60 @@ export function encodeMapEntry(key: Buffer, value: Buffer): Buffer {
 export function encodeWitnessUtxoMap(valueSats: number, scriptPubkeyHex: string): Buffer {
   const payload = Buffer.concat([encodeUInt64LE(valueSats), encodeScript(scriptPubkeyHex)]);
   return encodeMapEntry(Buffer.from([0x01]), payload);
+}
+
+// Fallback spend/txout byte sizes for script types not tracked in
+// SCRIPT_DUST_BYTES (op_return outputs and unknown scripts). We size a spend of
+// such an input like a segwit input, and compute the txout size from the actual
+// serialized scriptPubkey (8-byte value + length prefix + script bytes).
+const FALLBACK_SPEND_VBYTES = 67;
+
+function scriptSpendVBytes(scriptPubkeyHex: string): number {
+  const scriptType = classifyScript(scriptPubkeyHex);
+  if (scriptType === "op_return" || scriptType === "unknown") {
+    return FALLBACK_SPEND_VBYTES;
+  }
+  return SCRIPT_DUST_BYTES[scriptType].spendVBytes;
+}
+
+function scriptTxoutBytes(scriptPubkeyHex: string): number {
+  const scriptType = classifyScript(scriptPubkeyHex);
+  if (scriptType === "op_return" || scriptType === "unknown") {
+    const scriptBytes = scriptPubkeyHex.length / 2;
+    return 8 + encodeVarInt(scriptBytes).length + scriptBytes;
+  }
+  return SCRIPT_DUST_BYTES[scriptType].txoutBytes;
+}
+
+/**
+ * Estimate the virtual size (vB) of a transaction spending `inputs` into
+ * `outputs`, built from the per-script-type `spendVBytes`/`txoutBytes`
+ * constants in {@link SCRIPT_DUST_BYTES}. Used by the sat-for-sat fee-band
+ * check (`fee / vsize`). A small fixed base (version + locktime + segwit
+ * marker/flag + in/out count varints) is added on top of the per-input spend
+ * size and per-output txout size. This is a policy estimate, not an exact
+ * consensus weight computation.
+ */
+export function estimateTxVBytes(
+  inputs: Array<{ scriptPubkeyHex: string }>,
+  outputs: Array<{ scriptPubkeyHex: string }>,
+): number {
+  // version (4) + locktime (4) + segwit marker/flag (2 wu -> 0.5 vB) rounded up
+  // + input-count and output-count varints.
+  const base =
+    8 +
+    1 +
+    encodeVarInt(inputs.length).length +
+    encodeVarInt(outputs.length).length;
+
+  let vbytes = base;
+  for (const input of inputs) {
+    vbytes += scriptSpendVBytes(input.scriptPubkeyHex);
+  }
+  for (const output of outputs) {
+    vbytes += scriptTxoutBytes(output.scriptPubkeyHex);
+  }
+  return vbytes;
 }
 
 export function buildBuyerFillTemplatePsbt(

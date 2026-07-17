@@ -17,6 +17,7 @@ import {
   validateSatForSatOfferPsbt,
   type SatForSatAssetSide,
 } from "../src/sat-for-sat.ts";
+import { buildSatForSatBundlePsbt } from "../src/sat-for-sat-bundle.ts";
 
 // --- fixtures -------------------------------------------------------------
 
@@ -202,6 +203,39 @@ test("buildSatForSatOfferPsbt rejects a sub-dust computed output", () => {
   const params = buildOfferParams();
   params.feePayerChangeValueSats = 100; // below 294 P2WPKH dust threshold
   assert.throws(() => buildSatForSatOfferPsbt(params), /dust/i);
+});
+
+test("buildSatForSatOfferPsbt output is byte-identical to the m=n=1 bundle builder", () => {
+  const single = buildSatForSatOfferPsbt(buildOfferParams());
+  const bundle = buildSatForSatBundlePsbt({
+    offerer: {
+      legs: [
+        {
+          bumpInput: PARTY_A.bumpInput,
+          assetInput: PARTY_A.assetInput,
+          changeScriptPubkeyHex: PARTY_A.changeScriptPubkeyHex,
+          counterpartyOrdinalsScriptPubkeyHex: PARTY_A.counterpartyOrdinalsScriptPubkeyHex,
+        },
+      ],
+    },
+    taker: {
+      legs: [
+        {
+          bumpInput: PARTY_B.bumpInput,
+          assetInput: PARTY_B.assetInput,
+          changeScriptPubkeyHex: PARTY_B.changeScriptPubkeyHex,
+          counterpartyOrdinalsScriptPubkeyHex: PARTY_B.counterpartyOrdinalsScriptPubkeyHex,
+        },
+      ],
+    },
+    feeFundingInput: FEE_INPUT,
+    feePayerChangeScriptPubkeyHex: FEE_CHANGE_SPK,
+    feePayerChangeValueSats: FEE_CHANGE_VALUE,
+  });
+
+  assert.equal(single.psbtBase64, bundle.psbtBase64);
+  assert.deepEqual(single.inputOutpoints, bundle.inputOutpoints);
+  assert.deepEqual(single.outputValues, bundle.outputValues);
 });
 
 // --- offer validation -----------------------------------------------------
