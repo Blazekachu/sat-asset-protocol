@@ -1,8 +1,14 @@
 import { DatabaseSync } from "node:sqlite";
 
-import { assetMatchesRef, assetSatisfiesPredicate } from "./offer-predicates.ts";
+import {
+  assetMatchesRef,
+  assetSatisfiesPredicate,
+  assetSpansOverlap,
+} from "./offer-predicates.ts";
 import type {
   AttestationRecord,
+  BidFillRecord,
+  BidFillState,
   CollectionRecord,
   IntentQuery,
   ListingQuery,
@@ -89,6 +95,66 @@ function mapOfferRow(row: Record<string, unknown>): OfferRecord {
     bid_remaining_quantity: nullableNumber(row.bid_remaining_quantity),
   };
 }
+
+function mapBidFillRow(row: Record<string, unknown>): BidFillRecord {
+  return {
+    fill_id: String(row.fill_id),
+    bid_id: String(row.bid_id),
+    fill_offer_id: String(row.fill_offer_id),
+    filled_sat_number: nullableNumber(row.filled_sat_number),
+    filled_range_start: nullableNumber(row.filled_range_start),
+    filled_range_size: nullableNumber(row.filled_range_size),
+    filled_quantity: Number(row.filled_quantity),
+    seller_outpoint:
+      row.seller_outpoint === null || row.seller_outpoint === undefined
+        ? null
+        : String(row.seller_outpoint),
+    seller_utxo_value_sats: nullableNumber(row.seller_utxo_value_sats),
+    buyer_asset_script_pubkey_hex:
+      row.buyer_asset_script_pubkey_hex === null || row.buyer_asset_script_pubkey_hex === undefined
+        ? null
+        : String(row.buyer_asset_script_pubkey_hex),
+    price_sats: nullableNumber(row.price_sats),
+    state: String(row.state) as BidFillState,
+    created_at:
+      row.created_at === null || row.created_at === undefined ? null : String(row.created_at),
+  };
+}
+
+// Turn a persisted bid_fills row's delivered-asset columns into an
+// OfferAssetRef (sat vs range) for the overlap/containment re-check.
+function bidFillAssetRef(fill: BidFillRecord): OfferAssetRef {
+  if (fill.filled_range_start !== null && fill.filled_range_size !== null) {
+    return {
+      asset_type: "range",
+      asset_outpoint: fill.seller_outpoint,
+      sat_number: fill.filled_range_start,
+      sat_range_start: fill.filled_range_start,
+      sat_range_size: fill.filled_range_size,
+    };
+  }
+  return {
+    asset_type: "sat",
+    asset_outpoint: fill.seller_outpoint,
+    sat_number: fill.filled_sat_number ?? 0,
+  };
+}
+
+const BID_FILL_COLUMNS = `
+  fill_id,
+  bid_id,
+  fill_offer_id,
+  filled_sat_number,
+  filled_range_start,
+  filled_range_size,
+  filled_quantity,
+  seller_outpoint,
+  seller_utxo_value_sats,
+  buyer_asset_script_pubkey_hex,
+  price_sats,
+  state,
+  created_at
+`;
 
 // Full column list for offers_v2 SELECTs (order-independent; mapOfferRow reads
 // by name).
@@ -881,5 +947,276 @@ export class SqliteListingStore implements ListingStore {
       .run(offerId, nowIso);
 
     return Number(result.changes) === 1 ? this.getOffer(offerId) : null;
+  }
+
+  // --- Bid fill ledger (WS-D, ADR-0019) -----------------------------------
+
+  insertPendingBidFill(fill: BidFillRecord): void {
+    this.#database
+      .prepare(`
+        INSERT INTO bid_fills (
+          ${BID_FILL_COLUMNS}
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        fill.fill_id,
+        fill.bid_id,
+        fill.fill_offer_id,
+        fill.filled_sat_number,
+        fill.filled_range_start,
+        fill.filled_range_size,
+        fill.filled_quantity,
+        fill.seller_outpoint,
+        fill.seller_utxo_value_sats,
+        fill.buyer_asset_script_pubkey_hex,
+        fill.price_sats,
+        fill.state,
+        fill.created_at,
+      );
+  }
+
+  getBidFill(fillId: string): BidFillRecord | null {
+    const row = this.#database
+      .prepare(`SELECT ${BID_FILL_COLUMNS} FROM bid_fills WHERE fill_id = ? LIMIT 1`)
+      .get(fillId) as Record<string, unknown> | undefined;
+    return row ? mapBidFillRow(row) : null;
+  }
+
+  listBidFills(bidId: string): BidFillRecord[] {
+    return this.#database
+      .prepare(`
+        SELECT ${BID_FILL_COLUMNS} FROM bid_fills
+        WHERE bid_id = ?
+        ORDER BY created_at ASC, fill_id ASC
+      `)
+      .all(bidId)
+      .map((row) => mapBidFillRow(row as Record<string, unknown>));
+  }
+
+  // Correctness-critical atomic fill: re-read the bid under one BEGIN IMMEDIATE
+  // transaction, re-check the remainder + overlap ledger, insert the child
+  // settlement offer, transition the pending_build fill row to reserved, and CAS
+  // the bid's remainder/nonce/status. Any failure rolls the whole thing back.
+  recordBidFill(
+    bidId: string,
+    fillId: string,
+    nonce: string,
+    fillRow: OfferRecord,
+    filledDelta: number,
+    filledAssetRef: OfferAssetRef,
+  ): OfferRecord {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      // (1) re-read the bid, assert open + matching nonce.
+      const bid = this.getOffer(bidId);
+      if (!bid) {
+        throw new Error("bid not found");
+      }
+      if (bid.offer_kind !== "bid") {
+        throw new Error("offer is not a bid");
+      }
+      if (bid.status !== "open") {
+        throw new Error(`bid is not open (status=${bid.status})`);
+      }
+      if (bid.nonce !== nonce) {
+        throw new Error("nonce does not match the bid");
+      }
+      const remaining = bid.bid_remaining_quantity ?? 0;
+
+      // (2) assert 0 < filledDelta <= remaining.
+      if (!(filledDelta > 0 && filledDelta <= remaining)) {
+        throw new Error(
+          `fill quantity ${filledDelta} is not within 0 < q <= remaining (${remaining})`,
+        );
+      }
+
+      // (3) overlap re-check against reserved/settled ledger rows.
+      const activeFills = this.listBidFills(bidId).filter(
+        (fill) => fill.state === "reserved" || fill.state === "settled",
+      );
+      for (const fill of activeFills) {
+        if (assetSpansOverlap(filledAssetRef, bidFillAssetRef(fill))) {
+          throw new Error("fill overlaps a sat/range already recorded for this bid");
+        }
+      }
+
+      // (4) insert the child settlement offer + transition the pending_build
+      // ledger row to reserved.
+      this.#database
+        .prepare(`
+          INSERT INTO offers (
+            offer_id,
+            offerer_sat_number,
+            offerer_asset_outpoint,
+            taker_sat_number,
+            taker_asset_outpoint,
+            offer_psbt,
+            accept_psbt,
+            status,
+            created_at,
+            expires_at,
+            offer_kind,
+            negotiation_id,
+            parent_offer_id,
+            counter_index,
+            supersedes,
+            nonce,
+            give_assets_json,
+            want_spec_json,
+            taker_assets_json,
+            taker_build_json,
+            settlement_txid,
+            bid_target_quantity,
+            bid_total_btc_sats,
+            bid_remaining_quantity,
+            bid_want_spec_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(...this.#offerInsertValues(fillRow));
+
+      const fillTransition = this.#database
+        .prepare(`
+          UPDATE bid_fills
+          SET state = 'reserved', fill_offer_id = ?
+          WHERE fill_id = ? AND bid_id = ? AND state = 'pending_build'
+        `)
+        .run(fillRow.offer_id, fillId, bidId);
+      if (Number(fillTransition.changes) !== 1) {
+        throw new Error("pending_build fill row not found for transition");
+      }
+
+      // (5) CAS the bid remainder/status/nonce.
+      const casResult = this.#database
+        .prepare(`
+          UPDATE offers
+          SET bid_remaining_quantity = bid_remaining_quantity - ?,
+              status = CASE WHEN bid_remaining_quantity - ? = 0 THEN 'filled' ELSE 'open' END,
+              nonce = ?
+          WHERE offer_id = ? AND nonce = ? AND status = 'open'
+            AND bid_remaining_quantity >= ?
+        `)
+        .run(filledDelta, filledDelta, fillRow.nonce, bidId, nonce, filledDelta);
+
+      // (6) if the CAS did not apply, roll back.
+      if (Number(casResult.changes) !== 1) {
+        throw new Error("bid remainder CAS failed (stale nonce or over-commit)");
+      }
+
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+
+    const updated = this.getOffer(bidId);
+    if (!updated) {
+      throw new Error("bid disappeared after recordBidFill");
+    }
+    return updated;
+  }
+
+  settleBidFill(bidId: string, fillId: string, txid: string, nonce: string): OfferRecord {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const bid = this.getOffer(bidId);
+      if (!bid || bid.offer_kind !== "bid") {
+        throw new Error("bid not found");
+      }
+      if (bid.nonce !== nonce) {
+        throw new Error("nonce does not match the bid");
+      }
+      const fill = this.getBidFill(fillId);
+      if (!fill || fill.bid_id !== bidId) {
+        throw new Error("fill not found for this bid");
+      }
+      if (fill.state !== "reserved") {
+        throw new Error(`fill is not reserved (state=${fill.state})`);
+      }
+
+      const fillTransition = this.#database
+        .prepare(`
+          UPDATE bid_fills SET state = 'settled'
+          WHERE fill_id = ? AND bid_id = ? AND state = 'reserved'
+        `)
+        .run(fillId, bidId);
+      if (Number(fillTransition.changes) !== 1) {
+        throw new Error("fill row could not be transitioned to settled");
+      }
+
+      this.#database
+        .prepare(`
+          UPDATE offers SET status = 'settled', settlement_txid = ?
+          WHERE offer_id = ?
+        `)
+        .run(txid, fill.fill_offer_id);
+
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+
+    const updated = this.getOffer(bidId);
+    if (!updated) {
+      throw new Error("bid disappeared after settleBidFill");
+    }
+    return updated;
+  }
+
+  releaseBidFill(bidId: string, fillId: string, nonce: string): OfferRecord {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const bid = this.getOffer(bidId);
+      if (!bid || bid.offer_kind !== "bid") {
+        throw new Error("bid not found");
+      }
+      if (bid.nonce !== nonce) {
+        throw new Error("nonce does not match the bid");
+      }
+      const fill = this.getBidFill(fillId);
+      if (!fill || fill.bid_id !== bidId) {
+        throw new Error("fill not found for this bid");
+      }
+      if (fill.state !== "reserved") {
+        throw new Error(`only a reserved fill can be released (state=${fill.state})`);
+      }
+
+      // (a) ledger row reserved -> released (kept for audit).
+      const fillTransition = this.#database
+        .prepare(`
+          UPDATE bid_fills SET state = 'released'
+          WHERE fill_id = ? AND bid_id = ? AND state = 'reserved'
+        `)
+        .run(fillId, bidId);
+      if (Number(fillTransition.changes) !== 1) {
+        throw new Error("fill row could not be released");
+      }
+
+      // (b) credit the remainder back; reopen a filled bid if it was consumed.
+      this.#database
+        .prepare(`
+          UPDATE offers
+          SET bid_remaining_quantity = bid_remaining_quantity + ?,
+              status = CASE WHEN status = 'filled' THEN 'open' ELSE status END
+          WHERE offer_id = ?
+        `)
+        .run(fill.filled_quantity, bidId);
+
+      // (c) mark the child settlement row terminal cancelled.
+      this.#database
+        .prepare(`UPDATE offers SET status = 'cancelled' WHERE offer_id = ?`)
+        .run(fill.fill_offer_id);
+
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+
+    const updated = this.getOffer(bidId);
+    if (!updated) {
+      throw new Error("bid disappeared after releaseBidFill");
+    }
+    return updated;
   }
 }

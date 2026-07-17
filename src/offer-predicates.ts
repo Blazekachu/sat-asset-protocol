@@ -256,6 +256,78 @@ export function assetSatisfiesPredicate(
 }
 
 /**
+ * The half-open sat span `[start, end)` covered by an asset reference: a single
+ * sat occupies `[n, n+1)`; a range occupies `[start, start+size)`. Used by the
+ * bid-fill containment/overlap checks (WS-D, ADR-0019).
+ */
+export function assetRefSpan(ref: OfferAssetRef): { start: number; end: number } {
+  if (ref.asset_type === "range") {
+    const start = ref.sat_range_start ?? ref.sat_number ?? 0;
+    const size = ref.sat_range_size ?? 1;
+    return { start, end: start + size };
+  }
+  const start = ref.sat_number ?? 0;
+  return { start, end: start + 1 };
+}
+
+/** True when two asset references' sat spans overlap (half-open intervals). */
+export function assetSpansOverlap(a: OfferAssetRef, b: OfferAssetRef): boolean {
+  const sa = assetRefSpan(a);
+  const sb = assetRefSpan(b);
+  return sa.start < sb.end && sb.start < sa.end;
+}
+
+/**
+ * Bid-fill want matcher (WS-D, ADR-0019) — distinct from the exact-match
+ * {@link assetsSatisfyWant}, because a fill may deliver a *subset* of a wanted
+ * range and fills accumulate. Returns `{ ok: true }` or throws
+ * {@link ListingValidationError}.
+ *
+ * - `mode:"specific"`: `sellerAsset` must be FULLY CONTAINED within one wanted
+ *   range/ref (`start >= wanted_start AND start+size <= wanted_start+wanted_size`).
+ * - `mode:"predicate"`: `sellerAsset` must satisfy the predicate per sat (range
+ *   assets are rejected by {@link assetSatisfiesPredicate}).
+ *
+ * In both modes the fill must NOT overlap any range already recorded in
+ * `alreadyFilled` (the bid's reserved/settled fill ledger).
+ */
+export function bidFillMatchesWant(
+  spec: WantSpec,
+  sellerAsset: OfferAssetRef,
+  alreadyFilled: OfferAssetRef[],
+): { ok: true } {
+  for (const filled of alreadyFilled) {
+    if (assetSpansOverlap(sellerAsset, filled)) {
+      throw new ListingValidationError(
+        "bid fill overlaps a sat/range already filled on this bid",
+      );
+    }
+  }
+
+  if (spec.mode === "specific") {
+    const seller = assetRefSpan(sellerAsset);
+    const contained = spec.assets.some((wanted) => {
+      const w = assetRefSpan(wanted);
+      return seller.start >= w.start && seller.end <= w.end;
+    });
+    if (!contained) {
+      throw new ListingValidationError(
+        "bid fill asset is not fully contained within any wanted range/ref",
+      );
+    }
+    return { ok: true };
+  }
+
+  // predicate mode — assetSatisfiesPredicate rejects range assets itself.
+  if (!assetSatisfiesPredicate(spec.predicate, sellerAsset)) {
+    throw new ListingValidationError(
+      "bid fill asset does not satisfy the bid predicate",
+    );
+  }
+  return { ok: true };
+}
+
+/**
  * Authoritative want check used by `respondToIntent`. Returns `{ ok: true }`
  * or throws {@link ListingValidationError} with the specific reason.
  *

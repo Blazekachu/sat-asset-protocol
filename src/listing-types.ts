@@ -268,6 +268,36 @@ export interface SubmitBidFillRequest {
   nonce: string;
 }
 
+// --- Bid fill ledger (WS-D, ADR-0019) ------------------------------------
+
+// A bid_fills ledger row transitions pending_build -> reserved -> settled, or
+// reserved -> released (kept for audit). Only reserved/settled count against
+// the remainder and overlap checks.
+export type BidFillState = "pending_build" | "reserved" | "settled" | "released";
+
+/**
+ * A persisted row of the `bid_fills` ledger. Captures the exact asset delivered
+ * (`filled_sat_number` OR `filled_range_start`/`filled_range_size`), the
+ * *logical* `filled_quantity` (1 for a sat, sub-range size for a range — NOT the
+ * UTXO satoshi value), the seller UTXO postage `seller_utxo_value_sats`, and the
+ * BTC `price_sats` (= filled_quantity × unit_price).
+ */
+export interface BidFillRecord {
+  fill_id: string;
+  bid_id: string;
+  fill_offer_id: string;
+  filled_sat_number: number | null;
+  filled_range_start: number | null;
+  filled_range_size: number | null;
+  filled_quantity: number;
+  seller_outpoint: string | null;
+  seller_utxo_value_sats: number | null;
+  buyer_asset_script_pubkey_hex: string | null;
+  price_sats: number | null;
+  state: BidFillState;
+  created_at: string | null;
+}
+
 /**
  * Filter contract for {@link ListingStore.listOffers}. All fields are optional;
  * a query with no fields returns all offers. Provided fields are applied as
@@ -318,4 +348,18 @@ export interface ListingStore {
   settleAcceptedOffer(offerId: string, txid: string, nonce: string): OfferRecord | null;
   cancelOpenOffer(offerId: string, nonce: string): OfferRecord | null;
   expireOffer(offerId: string, nowIso: string): OfferRecord | null;
+  // --- Bid fill ledger (WS-D, ADR-0019) ---
+  insertPendingBidFill(fill: BidFillRecord): void;
+  getBidFill(fillId: string): BidFillRecord | null;
+  listBidFills(bidId: string): BidFillRecord[];
+  recordBidFill(
+    bidId: string,
+    fillId: string,
+    nonce: string,
+    fillRow: OfferRecord,
+    filledDelta: number,
+    filledAssetRef: OfferAssetRef,
+  ): OfferRecord;
+  settleBidFill(bidId: string, fillId: string, txid: string, nonce: string): OfferRecord;
+  releaseBidFill(bidId: string, fillId: string, nonce: string): OfferRecord;
 }

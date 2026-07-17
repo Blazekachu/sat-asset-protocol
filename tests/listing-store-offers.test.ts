@@ -3,7 +3,13 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { SqliteListingStore } from "../src/listing-store.ts";
-import type { OfferAssetRef, OfferRecord, SideBuildData, WantSpec } from "../src/listing-types.ts";
+import type {
+  BidFillRecord,
+  OfferAssetRef,
+  OfferRecord,
+  SideBuildData,
+  WantSpec,
+} from "../src/listing-types.ts";
 
 // --- helpers --------------------------------------------------------------
 
@@ -314,4 +320,172 @@ test("expireOffer only expires an open, past-expiry round", () => {
 
   // Future expiry → null (not yet expired).
   assert.equal(store.expireOffer("exp-2", NOW), null);
+});
+
+// --- Partially-fillable BTC buy bids ledger (WS-D, ADR-0019) -------------
+
+function makeBid(overrides: Partial<OfferRecord> & { offer_id: string }): OfferRecord {
+  const wantSpec: WantSpec = { mode: "specific", assets: [
+    { asset_type: "range", asset_outpoint: "r".repeat(64) + ":0", sat_number: 500, sat_range_start: 500, sat_range_size: 10 },
+  ] };
+  return {
+    offer_id: overrides.offer_id,
+    offerer_sat_number: 0,
+    offerer_asset_outpoint: overrides.offer_id,
+    taker_sat_number: null,
+    taker_asset_outpoint: null,
+    offer_psbt: null,
+    accept_psbt: null,
+    status: "open",
+    created_at: NOW,
+    expires_at: null,
+    offer_kind: "bid",
+    negotiation_id: overrides.offer_id,
+    parent_offer_id: null,
+    counter_index: 0,
+    supersedes: null,
+    nonce: "nonce-" + overrides.offer_id,
+    give_assets: null,
+    want_spec: wantSpec,
+    taker_assets: null,
+    taker_build: null,
+    settlement_txid: null,
+    bid_target_quantity: 10,
+    bid_total_btc_sats: 10000,
+    bid_remaining_quantity: 10,
+    ...overrides,
+  };
+}
+
+function pendingFill(fillId: string, bidId: string, fillOfferId: string, rangeStart: number, rangeSize: number): BidFillRecord {
+  return {
+    fill_id: fillId,
+    bid_id: bidId,
+    fill_offer_id: fillOfferId,
+    filled_sat_number: null,
+    filled_range_start: rangeStart,
+    filled_range_size: rangeSize,
+    filled_quantity: rangeSize,
+    seller_outpoint: "s".repeat(64) + ":" + rangeStart,
+    seller_utxo_value_sats: 546,
+    buyer_asset_script_pubkey_hex: "0014" + "ee".repeat(20),
+    price_sats: rangeSize * 1000,
+    state: "pending_build",
+    created_at: NOW,
+  };
+}
+
+// A child settlement OfferRecord (concrete, accepted) inserted by recordBidFill.
+function childFillRow(fillOfferId: string, bidId: string, ref: OfferAssetRef): OfferRecord {
+  return {
+    offer_id: fillOfferId,
+    offerer_sat_number: 0,
+    offerer_asset_outpoint: fillOfferId,
+    taker_sat_number: null,
+    taker_asset_outpoint: null,
+    offer_psbt: "psbt",
+    accept_psbt: null,
+    status: "accepted",
+    created_at: NOW,
+    expires_at: null,
+    offer_kind: "concrete",
+    negotiation_id: bidId,
+    parent_offer_id: bidId,
+    counter_index: 0,
+    supersedes: null,
+    nonce: "n-" + fillOfferId,
+    give_assets: null,
+    want_spec: null,
+    taker_assets: [ref],
+    taker_build: null,
+    settlement_txid: null,
+    bid_target_quantity: null,
+    bid_total_btc_sats: null,
+    bid_remaining_quantity: null,
+  };
+}
+
+const rangeRef = (start: number, size: number): OfferAssetRef => ({
+  asset_type: "range",
+  asset_outpoint: "s".repeat(64) + ":" + start,
+  sat_number: start,
+  sat_range_start: start,
+  sat_range_size: size,
+});
+
+test("[BD5] concurrent over-commit: second recordBidFill with the same starting nonce fails CAS; remainder debited once", () => {
+  const store = new SqliteListingStore(new DatabaseSync(":memory:"));
+  const bid = makeBid({ offer_id: "bid-1" });
+  store.insertOffer(bid);
+
+  store.insertPendingBidFill(pendingFill("f1", "bid-1", "child-1", 500, 6));
+  store.insertPendingBidFill(pendingFill("f2", "bid-1", "child-2", 506, 6));
+
+  // First fill succeeds and rotates the nonce.
+  const after1 = store.recordBidFill("bid-1", "f1", bid.nonce, childFillRow("child-1", "bid-1", rangeRef(500, 6)), 6, rangeRef(500, 6));
+  assert.equal(after1.bid_remaining_quantity, 4);
+  assert.notEqual(after1.nonce, bid.nonce);
+
+  // Second fill reuses the STALE starting nonce -> CAS fails, ledger unchanged.
+  assert.throws(
+    () => store.recordBidFill("bid-1", "f2", bid.nonce, childFillRow("child-2", "bid-1", rangeRef(506, 6)), 6, rangeRef(506, 6)),
+    /CAS failed|nonce/,
+  );
+  const cur = store.getOffer("bid-1")!;
+  assert.equal(cur.bid_remaining_quantity, 4); // debited once only
+  assert.equal(store.getBidFill("f2")!.state, "pending_build"); // untouched
+  assert.equal(store.getOffer("child-2"), null); // no child inserted
+});
+
+test("[BD8] duplicate/overlapping recordBidFill is rejected inside the transaction; ledger unchanged", () => {
+  const store = new SqliteListingStore(new DatabaseSync(":memory:"));
+  const bid = makeBid({ offer_id: "bid-2" });
+  store.insertOffer(bid);
+  store.insertPendingBidFill(pendingFill("f1", "bid-2", "child-1", 500, 4));
+  store.insertPendingBidFill(pendingFill("f2", "bid-2", "child-2", 502, 4)); // overlaps [500,504)
+
+  const cur = store.getOffer("bid-2")!;
+  store.recordBidFill("bid-2", "f1", cur.nonce, childFillRow("child-1", "bid-2", rangeRef(500, 4)), 4, rangeRef(500, 4));
+  const afterFirst = store.getOffer("bid-2")!;
+
+  assert.throws(
+    () => store.recordBidFill("bid-2", "f2", afterFirst.nonce, childFillRow("child-2", "bid-2", rangeRef(502, 4)), 4, rangeRef(502, 4)),
+    /overlap/,
+  );
+  const final = store.getOffer("bid-2")!;
+  assert.equal(final.bid_remaining_quantity, 6); // only the first fill applied
+  assert.equal(store.getBidFill("f2")!.state, "pending_build");
+});
+
+test("[BD9] reserved -> settled and reserved -> release lifecycle credits remainder + cancels child", () => {
+  const store = new SqliteListingStore(new DatabaseSync(":memory:"));
+  const bid = makeBid({ offer_id: "bid-3", bid_target_quantity: 10, bid_remaining_quantity: 10, bid_total_btc_sats: 10000 });
+  store.insertOffer(bid);
+  store.insertPendingBidFill(pendingFill("f1", "bid-3", "child-1", 500, 10));
+
+  // record -> reserved (bid becomes filled at remainder 0).
+  const recorded = store.recordBidFill("bid-3", "f1", bid.nonce, childFillRow("child-1", "bid-3", rangeRef(500, 10)), 10, rangeRef(500, 10));
+  assert.equal(store.getBidFill("f1")!.state, "reserved");
+  assert.equal(recorded.status, "filled");
+  assert.equal(recorded.bid_remaining_quantity, 0);
+
+  // settle a reserved fill.
+  const settled = store.settleBidFill("bid-3", "f1", "txid-abc", recorded.nonce);
+  assert.equal(store.getBidFill("f1")!.state, "settled");
+  assert.equal(store.getOffer("child-1")!.status, "settled");
+  assert.equal(store.getOffer("child-1")!.settlement_txid, "txid-abc");
+  assert.ok(settled);
+
+  // Now test release on a fresh reserved fill (different bid).
+  const bid4 = makeBid({ offer_id: "bid-4", bid_target_quantity: 10, bid_remaining_quantity: 10, bid_total_btc_sats: 10000 });
+  store.insertOffer(bid4);
+  store.insertPendingBidFill(pendingFill("g1", "bid-4", "child-g1", 500, 10));
+  const rec4 = store.recordBidFill("bid-4", "g1", bid4.nonce, childFillRow("child-g1", "bid-4", rangeRef(500, 10)), 10, rangeRef(500, 10));
+  assert.equal(rec4.status, "filled");
+
+  const released = store.releaseBidFill("bid-4", "g1", rec4.nonce);
+  assert.equal(store.getBidFill("g1")!.state, "released");
+  assert.equal(store.getOffer("child-g1")!.status, "cancelled");
+  assert.equal(released.bid_remaining_quantity, 10); // credited back
+  assert.equal(released.status, "open"); // reopened from filled
 });

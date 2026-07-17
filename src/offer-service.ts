@@ -25,6 +25,8 @@ import {
   type ListingOrdClient,
 } from "./listing-service.ts";
 import type {
+  BidFillRecord,
+  BuildBidFillRequest,
   BuildConcreteOfferRequest,
   CounterOfferRequest,
   CreateOfferRequest,
@@ -33,14 +35,25 @@ import type {
   OfferAssetRef,
   OfferQuery,
   OfferRecord,
+  PostBidRequest,
   PostIntentRequest,
   RespondToIntentRequest,
   SideBuildData,
+  SubmitBidFillRequest,
   SubmitOfferPsbtRequest,
   WantSpec,
 } from "./listing-types.ts";
-import { assetsSatisfyWant, normalizeAssetRef, normalizeWantSpec } from "./offer-predicates.ts";
+import {
+  assetRefSpan,
+  assetSatisfiesPredicate,
+  bidFillMatchesWant,
+  normalizeAssetRef,
+  normalizeWantSpec,
+  assetsSatisfyWant,
+} from "./offer-predicates.ts";
+import { buildBuyerFillTemplatePsbt, validateBidFillPsbt } from "./psbt.ts";
 import type { DustPolicy, TemplateInput } from "./psbt.ts";
+import type { OrdSat, OrdStatus } from "./types.ts";
 import {
   buildSatForSatBundlePsbt,
   validateSatForSatBundleAcceptPsbt,
@@ -67,6 +80,20 @@ export interface OfferServiceDependencies {
   createOfferId?: () => string;
   createNonce?: () => string;
   dustPolicy?: DustPolicy;
+}
+
+// The bid discovery path needs sat/status resolution beyond ListingOrdClient's
+// output(). The concrete OrdClient (and the test stubs) supply these; we narrow
+// to them only inside findCandidateHolders.
+interface SatCapableOrdClient {
+  sat(number: number | bigint): Promise<OrdSat>;
+  status(): Promise<OrdStatus>;
+}
+
+export interface CandidateHolder {
+  sat_number: number;
+  satpoint: string;
+  address: string;
 }
 
 export class OfferService {
@@ -606,6 +633,369 @@ export class OfferService {
       .map((offer) => this.#lazyExpire(offer));
   }
 
+  // --- Partially-fillable BTC buy bids (WS-D, ADR-0019) -------------------
+
+  /**
+   * Post an open, discoverable BTC buy bid. `unit_price = floor(T / N)` (>= 1);
+   * flooring favors the bidder (residual up to N-1 sats intentionally unspent).
+   */
+  async postBid(input: PostBidRequest): Promise<OfferRecord> {
+    const wantSpec = normalizeWantSpec(input.want_spec);
+    const targetQuantity = ensureInteger(input.bid_target_quantity, "bid_target_quantity");
+    const totalBtcSats = ensureInteger(input.bid_total_btc_sats, "bid_total_btc_sats");
+    if (targetQuantity < 1) {
+      throw new ListingValidationError("bid_target_quantity must be >= 1");
+    }
+    if (totalBtcSats < targetQuantity) {
+      throw new ListingValidationError(
+        "bid_total_btc_sats must be >= bid_target_quantity (unit price >= 1 sat/sat)",
+      );
+    }
+
+    const bidId = this.#createOfferId();
+    const record: OfferRecord = {
+      offer_id: bidId,
+      offerer_sat_number: 0,
+      offerer_asset_outpoint: bidId, // bids have no offerer asset; use a stable non-empty token
+      taker_sat_number: null,
+      taker_asset_outpoint: null,
+      offer_psbt: null,
+      accept_psbt: null,
+      status: "open",
+      created_at: this.#now().toISOString(),
+      expires_at: input.expires_at ?? null,
+      offer_kind: "bid",
+      negotiation_id: bidId,
+      parent_offer_id: null,
+      counter_index: 0,
+      supersedes: null,
+      nonce: this.#createNonce(),
+      give_assets: null,
+      want_spec: wantSpec,
+      taker_assets: null,
+      taker_build: null,
+      settlement_txid: null,
+      bid_target_quantity: targetQuantity,
+      bid_total_btc_sats: totalBtcSats,
+      bid_remaining_quantity: targetQuantity,
+    };
+    this.#store.insertOffer(record);
+    return record;
+  }
+
+  listBids(query: { status?: OfferRecord["status"] } = {}): OfferRecord[] {
+    return this.#store
+      .listOffers({ offer_kind: "bid", status: query.status })
+      .map((bid) => this.#lazyExpire(bid));
+  }
+
+  getBid(bidId: string): OfferRecord | null {
+    const bid = this.#store.getOffer(bidId);
+    if (!bid || bid.offer_kind !== "bid") {
+      return null;
+    }
+    return this.#lazyExpire(bid);
+  }
+
+  /**
+   * Discovery (advisory, live-ord). Resolves candidate sats to their current
+   * holding UTXO/address via ord's `GET /sat/{n}`. For a specific-range bid the
+   * candidates come from the wanted ranges; for a predicate bid the caller
+   * supplies `candidateSats` (predicate-checked). Skips entries whose satpoint/
+   * address is null; throws if the ord node is missing --index-sats/-addresses.
+   */
+  async findCandidateHolders(
+    bidId: string,
+    candidateSats: number[] = [],
+  ): Promise<CandidateHolder[]> {
+    const bid = this.#loadBid(bidId);
+    const spec = bid.want_spec;
+    if (!spec) {
+      throw new ListingValidationError("bid has no want_spec");
+    }
+
+    const ord = this.#ordClient as unknown as SatCapableOrdClient;
+    if (typeof ord.status !== "function" || typeof ord.sat !== "function") {
+      throw new ListingValidationError("ord client is not sat-capable (discovery is live-ord)");
+    }
+    const status = await ord.status();
+    if (!status.sat_index || !status.address_index) {
+      throw new ListingValidationError(
+        "ord node must run with --index-sats and --index-addresses for bid discovery",
+      );
+    }
+
+    // Determine candidate sat numbers.
+    let candidates: number[];
+    if (spec.mode === "specific") {
+      candidates = [];
+      for (const ref of spec.assets) {
+        const span = assetRefSpan(ref);
+        for (let n = span.start; n < span.end; n += 1) {
+          candidates.push(n);
+        }
+      }
+    } else {
+      candidates = candidateSats.filter((n) =>
+        assetSatisfiesPredicate(spec.predicate, {
+          asset_type: "sat",
+          asset_outpoint: null,
+          sat_number: n,
+        }),
+      );
+    }
+
+    const holders: CandidateHolder[] = [];
+    for (const satNumber of candidates) {
+      const sat = await ord.sat(satNumber);
+      if (sat.satpoint === null || sat.address === null) {
+        continue;
+      }
+      holders.push({ sat_number: satNumber, satpoint: sat.satpoint, address: sat.address });
+    }
+    return holders;
+  }
+
+  /**
+   * Build the unsigned per-fill PSBT for a single seller UTXO. Validates the
+   * seller asset against the bid's want (bid-specific containment matcher),
+   * derives the LOGICAL fill quantity k from the delivered asset, reads the
+   * seller UTXO's on-chain postage value separately, and persists a
+   * pending_build ledger row. Returns the unsigned PSBT + its fill_id.
+   */
+  async buildBidFill(
+    bidId: string,
+    input: BuildBidFillRequest,
+  ): Promise<{ psbt_base64: string; fill_id: string; input_outpoints: string[]; output_values: number[] }> {
+    const bid = this.#loadBid(bidId);
+    if (bid.status !== "open") {
+      throw new ListingValidationError(`bid is not open (status=${bid.status})`);
+    }
+    const spec = bid.want_spec;
+    if (!spec) {
+      throw new ListingValidationError("bid has no want_spec");
+    }
+    const remaining = bid.bid_remaining_quantity ?? 0;
+    const targetQuantity = bid.bid_target_quantity ?? 0;
+    const totalBtcSats = bid.bid_total_btc_sats ?? 0;
+    const unitPrice = Math.floor(totalBtcSats / targetQuantity);
+
+    const sellerAsset = normalizeAssetRef(input.fill_asset, "fill_asset");
+    const sellerOutpoint = ensureRequiredString(input.seller_outpoint, "seller_outpoint");
+    const buyerAssetScriptPubkeyHex = ensureRequiredString(
+      input.buyer_asset_script_pubkey_hex,
+      "buyer_asset_script_pubkey_hex",
+    );
+    const sellerBuild = this.#normalizeSideBuild(input.seller_build, "seller_build");
+
+    // Overlap re-check against active (reserved/settled) ledger rows.
+    const alreadyFilled = this.#store
+      .listBidFills(bidId)
+      .filter((fill) => fill.state === "reserved" || fill.state === "settled")
+      .map((fill) => this.#bidFillAssetRef(fill));
+    bidFillMatchesWant(spec, sellerAsset, alreadyFilled);
+
+    // Logical fill quantity k derived from the DELIVERED asset (not want_spec).
+    const k = sellerAsset.asset_type === "range" ? (sellerAsset.sat_range_size ?? 1) : 1;
+    if (k > remaining) {
+      throw new ListingValidationError(
+        `fill quantity ${k} exceeds remaining bid quantity ${remaining}`,
+      );
+    }
+
+    // Seller UTXO on-chain VALUE (postage), independent of k.
+    const sellerOrdOutput = await fetchIndexedUnspentOutput(this.#ordClient, sellerOutpoint);
+    const sellerUtxoValueSats = sellerOrdOutput.value;
+    const listingPriceSats = k * unitPrice;
+
+    // Resolve the two bidder bumps + fee funding.
+    if (sellerBuild.bump_outpoints.length !== 2) {
+      throw new ListingValidationError(
+        "seller_build.bump_outpoints must contain exactly 2 bidder bump outpoints",
+      );
+    }
+    const bumpInputs = await Promise.all(
+      sellerBuild.bump_outpoints.map((outpoint) => this.#resolveTemplateInput(outpoint)),
+    );
+    const feeFundingInput = await this.#resolveTemplateInput(input.fee_funding_outpoint);
+    const feePayerChangeScriptPubkeyHex = ensureRequiredString(
+      input.fee_payer_change_script_pubkey_hex,
+      "fee_payer_change_script_pubkey_hex",
+    );
+    const feePayerChangeValueSats = ensureInteger(
+      input.fee_payer_change_value_sats,
+      "fee_payer_change_value_sats",
+    );
+    const dustPolicy = this.#buildDustPolicy(input.max_fee_rate_sat_per_vb);
+
+    // Reuse the canonical 2-bump fill builder with role mapping:
+    // filler = "seller" (input 2 = their sat UTXO), bidder = "buyer".
+    const template = buildBuyerFillTemplatePsbt(
+      {
+        sellerOutpoint,
+        sellerInputValueSats: sellerUtxoValueSats,
+        sellerInputScriptPubkeyHex: sellerOrdOutput.script_pubkey,
+        listingPriceSats,
+        bumpInputs,
+        fundingInputs: [feeFundingInput],
+        buyerBumpScriptPubkeyHex: sellerBuild.change_script_pubkey_hex,
+        buyerAssetScriptPubkeyHex,
+        buyerChangeScriptPubkeyHex: feePayerChangeScriptPubkeyHex,
+        buyerChangeValueSats: feePayerChangeValueSats,
+      },
+      dustPolicy ?? {},
+    );
+
+    const fillId = this.#createOfferId();
+    const fillOfferId = this.#createOfferId();
+    const fillRecord: BidFillRecord = {
+      fill_id: fillId,
+      bid_id: bidId,
+      fill_offer_id: fillOfferId,
+      filled_sat_number: sellerAsset.asset_type === "sat" ? (sellerAsset.sat_number ?? null) : null,
+      filled_range_start:
+        sellerAsset.asset_type === "range" ? (sellerAsset.sat_range_start ?? null) : null,
+      filled_range_size:
+        sellerAsset.asset_type === "range" ? (sellerAsset.sat_range_size ?? null) : null,
+      filled_quantity: k,
+      seller_outpoint: sellerOutpoint,
+      seller_utxo_value_sats: sellerUtxoValueSats,
+      buyer_asset_script_pubkey_hex: buyerAssetScriptPubkeyHex,
+      price_sats: listingPriceSats,
+      state: "pending_build",
+      created_at: this.#now().toISOString(),
+    };
+    this.#store.insertPendingBidFill(fillRecord);
+
+    return {
+      psbt_base64: template.psbtBase64,
+      fill_id: fillId,
+      input_outpoints: template.inputOutpoints,
+      output_values: template.outputValues,
+    };
+  }
+
+  /**
+   * Submit a co-signed fill PSBT. Re-reads the pending_build ledger row by
+   * fill_id, validates the PSBT against server-persisted values, then atomically
+   * records the reserved fill (debiting the remainder by the logical quantity
+   * and rotating the nonce). Returns the updated bid.
+   */
+  async submitBidFill(bidId: string, input: SubmitBidFillRequest): Promise<OfferRecord> {
+    const bid = this.#loadBid(bidId);
+    if (bid.status !== "open") {
+      throw new ListingValidationError(`bid is not open (status=${bid.status})`);
+    }
+    const nonce = ensureRequiredString(input.nonce, "nonce");
+    if (nonce !== bid.nonce) {
+      throw new ListingValidationError("nonce does not match the bid");
+    }
+    const fillId = ensureRequiredString(input.fill_id, "fill_id");
+    const fillPsbt = ensureRequiredString(input.fill_psbt, "fill_psbt");
+
+    const pending = this.#store.getBidFill(fillId);
+    if (!pending || pending.bid_id !== bidId) {
+      throw new ListingValidationError("fill not found for this bid");
+    }
+    if (pending.state !== "pending_build") {
+      throw new ListingValidationError(`fill is not pending build (state=${pending.state})`);
+    }
+
+    // Validate the co-signed PSBT against SERVER-persisted values.
+    validateBidFillPsbt(
+      fillPsbt,
+      ensureRequiredString(pending.seller_outpoint, "seller_outpoint"),
+      pending.price_sats ?? 0,
+      ensureRequiredString(pending.buyer_asset_script_pubkey_hex, "buyer_asset_script_pubkey_hex"),
+      pending.seller_utxo_value_sats ?? 0,
+      this.#dustPolicy,
+    );
+
+    const filledAssetRef = this.#bidFillAssetRef(pending);
+    const nextNonce = this.#createNonce();
+    const fillRow: OfferRecord = {
+      offer_id: pending.fill_offer_id,
+      offerer_sat_number: 0,
+      offerer_asset_outpoint: pending.seller_outpoint ?? pending.fill_offer_id,
+      taker_sat_number: null,
+      taker_asset_outpoint: null,
+      offer_psbt: fillPsbt,
+      accept_psbt: null,
+      status: "accepted",
+      created_at: this.#now().toISOString(),
+      expires_at: null,
+      offer_kind: "concrete",
+      negotiation_id: bid.negotiation_id,
+      parent_offer_id: bidId,
+      counter_index: 0,
+      supersedes: null,
+      nonce: pending.fill_offer_id,
+      give_assets: null,
+      want_spec: null,
+      taker_assets: [filledAssetRef],
+      taker_build: null,
+      settlement_txid: null,
+      bid_target_quantity: null,
+      bid_total_btc_sats: null,
+      bid_remaining_quantity: null,
+    };
+
+    try {
+      return this.#store.recordBidFill(
+        bidId,
+        fillId,
+        nonce,
+        fillRow,
+        pending.filled_quantity,
+        filledAssetRef,
+      );
+    } catch (error) {
+      throw new ListingValidationError(
+        error instanceof Error ? error.message : "bid fill could not be recorded",
+      );
+    }
+  }
+
+  /** Report on-chain settlement of a reserved fill (RD2). */
+  settleBidFill(bidId: string, fillId: string, txid: string, nonce: string): OfferRecord {
+    this.#loadBid(bidId);
+    const settlementTxid = ensureRequiredString(txid, "txid");
+    const guardNonce = ensureRequiredString(nonce, "nonce");
+    try {
+      return this.#store.settleBidFill(bidId, fillId, settlementTxid, guardNonce);
+    } catch (error) {
+      throw new ListingValidationError(
+        error instanceof Error ? error.message : "bid fill could not be settled",
+      );
+    }
+  }
+
+  /** Release a reserved fill (recovery): credit the remainder, cancel the child. */
+  releaseBidFill(bidId: string, fillId: string, nonce: string): OfferRecord {
+    this.#loadBid(bidId);
+    const guardNonce = ensureRequiredString(nonce, "nonce");
+    try {
+      return this.#store.releaseBidFill(bidId, fillId, guardNonce);
+    } catch (error) {
+      throw new ListingValidationError(
+        error instanceof Error ? error.message : "bid fill could not be released",
+      );
+    }
+  }
+
+  /** Cancel an open bid (CAS open -> cancelled). */
+  cancelBid(bidId: string, nonce: string): OfferRecord {
+    this.#loadBid(bidId);
+    const guardNonce = ensureRequiredString(nonce, "nonce");
+    const updated = this.#store.cancelOpenOffer(bidId, guardNonce);
+    if (!updated) {
+      throw new ListingValidationError(
+        "bid could not be cancelled (must be an open bid with a matching nonce)",
+      );
+    }
+    return updated;
+  }
+
   // --- Private helpers ----------------------------------------------------
 
   #loadWithLazyExpiry(offerId: string): OfferRecord {
@@ -614,6 +1004,34 @@ export class OfferService {
       throw new OfferNotFoundError("offer not found");
     }
     return this.#lazyExpire(offer);
+  }
+
+  // Load a bid (kind='bid') with lazy expiry, or throw OfferNotFoundError.
+  #loadBid(bidId: string): OfferRecord {
+    const bid = this.#store.getOffer(bidId);
+    if (!bid || bid.offer_kind !== "bid") {
+      throw new OfferNotFoundError("bid not found");
+    }
+    return this.#lazyExpire(bid);
+  }
+
+  // Turn a persisted bid_fills row's delivered-asset columns into an
+  // OfferAssetRef for overlap checks.
+  #bidFillAssetRef(fill: BidFillRecord): OfferAssetRef {
+    if (fill.filled_range_start !== null && fill.filled_range_size !== null) {
+      return {
+        asset_type: "range",
+        asset_outpoint: fill.seller_outpoint,
+        sat_number: fill.filled_range_start,
+        sat_range_start: fill.filled_range_start,
+        sat_range_size: fill.filled_range_size,
+      };
+    }
+    return {
+      asset_type: "sat",
+      asset_outpoint: fill.seller_outpoint,
+      sat_number: fill.filled_sat_number ?? 0,
+    };
   }
 
   // Report (and persist opportunistically) an open, past-expiry round as

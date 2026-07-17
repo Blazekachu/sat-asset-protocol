@@ -11,9 +11,15 @@ import {
   normalizeWantSpec,
 } from "../src/offer-predicates.ts";
 import { OfferService } from "../src/offer-service.ts";
+import {
+  buildUnsignedTransaction,
+  encodeMapEntry,
+  encodeWitnessUtxoMap,
+  PSBT_MAGIC,
+} from "../src/psbt.ts";
 import type { OfferAssetRef, WantSpec } from "../src/listing-types.ts";
 import type { ListingOrdClient } from "../src/listing-service.ts";
-import type { OrdOutput } from "../src/types.ts";
+import type { OrdOutput, OrdSat, OrdStatus } from "../src/types.ts";
 
 // --- predicate section (RD1, finding 3/4) ---------------------------------
 
@@ -384,4 +390,262 @@ test("expireOffer + lazy expiry reports a past-expiry open round as expired", as
   // Lazy expiry on read.
   const fetched = service.getOffer(intent.offer_id);
   assert.equal(fetched?.status, "expired");
+});
+
+// --- Partially-fillable BTC buy bids (WS-D, ADR-0019) ---------------------
+
+const BID_SELLER_OP = "5".repeat(64) + ":0";
+const BID_BUMP0_OP = "6".repeat(64) + ":0";
+const BID_BUMP1_OP = "7".repeat(64) + ":0";
+const BID_FEE_OP = "8".repeat(64) + ":0";
+
+const SELLER_SPK = p2wpkh("aa"); // makeOrdOutput default script for the seller UTXO
+const BUYER_BUMP_SPK = p2wpkh("cc");
+const BUYER_ASSET_SPK = p2wpkh("ee");
+const FEE_CHANGE_SPK2 = p2wpkh("ff");
+const FEE_CHANGE_VALUE2 = 3000;
+const SELLER_POSTAGE = 546;
+
+// Ord outputs needed to build any bid fill (seller UTXO + 2 bumps + fee funding).
+function bidFillOrdOutputs(sellerSatStart: number): Record<string, OrdOutput> {
+  return {
+    [BID_SELLER_OP]: makeOrdOutput(BID_SELLER_OP, sellerSatStart),
+    [BID_BUMP0_OP]: { ...makeOrdOutput(BID_BUMP0_OP, 900000), value: 600, script_pubkey: p2wpkh("b0") },
+    [BID_BUMP1_OP]: { ...makeOrdOutput(BID_BUMP1_OP, 900001), value: 600, script_pubkey: p2wpkh("b1") },
+    [BID_FEE_OP]: { ...makeOrdOutput(BID_FEE_OP, 900002), value: 10000, script_pubkey: p2wpkh("fe") },
+  };
+}
+
+const bidSellerBuild = () => ({
+  bump_outpoints: [BID_BUMP0_OP, BID_BUMP1_OP],
+  change_script_pubkey_hex: BUYER_BUMP_SPK,
+  ordinals_script_pubkey_hex: p2wpkh("dd"),
+});
+
+function buildFillRequest(fillAsset: OfferAssetRef) {
+  return {
+    fill_asset: fillAsset,
+    seller_outpoint: BID_SELLER_OP,
+    seller_build: bidSellerBuild(),
+    buyer_asset_script_pubkey_hex: BUYER_ASSET_SPK,
+    fee_funding_outpoint: BID_FEE_OP,
+    fee_payer_change_script_pubkey_hex: FEE_CHANGE_SPK2,
+    fee_payer_change_value_sats: FEE_CHANGE_VALUE2,
+  };
+}
+
+// Compose a CO-SIGNED bid-fill PSBT matching buildBuyerFillTemplatePsbt's layout:
+//   inputs:  bump0(SIGHASH_ALL), bump1(ALL), seller(SINGLE|ANYONECANPAY), fee(ALL)
+//   outputs: [1200 -> buyerBump, postage -> buyerAsset, price -> seller, feeChange]
+function buildCoSignedFillPsbt(listingPriceSats: number, sellerSig = 0x83): string {
+  const inputs = [
+    { outpoint: BID_BUMP0_OP, valueSats: 600, scriptPubkeyHex: p2wpkh("b0"), sighash: 0x01 },
+    { outpoint: BID_BUMP1_OP, valueSats: 600, scriptPubkeyHex: p2wpkh("b1"), sighash: 0x01 },
+    { outpoint: BID_SELLER_OP, valueSats: SELLER_POSTAGE, scriptPubkeyHex: SELLER_SPK, sighash: sellerSig },
+    { outpoint: BID_FEE_OP, valueSats: 10000, scriptPubkeyHex: p2wpkh("fe"), sighash: 0x01 },
+  ];
+  const outputs = [
+    { valueSats: 1200, scriptPubkeyHex: BUYER_BUMP_SPK },
+    { valueSats: SELLER_POSTAGE, scriptPubkeyHex: BUYER_ASSET_SPK },
+    { valueSats: listingPriceSats, scriptPubkeyHex: SELLER_SPK },
+    { valueSats: FEE_CHANGE_VALUE2, scriptPubkeyHex: FEE_CHANGE_SPK2 },
+  ];
+  const unsignedTx = buildUnsignedTransaction(
+    inputs.map((i) => i.outpoint),
+    outputs,
+  );
+  const globalMap = Buffer.concat([
+    encodeMapEntry(Buffer.from([0x00]), unsignedTx),
+    Buffer.from([0x00]),
+  ]);
+  const inputMaps = inputs.map((spec) => {
+    const entries: Buffer[] = [encodeWitnessUtxoMap(spec.valueSats, spec.scriptPubkeyHex)];
+    const pubkey = Buffer.from("02".repeat(33), "hex");
+    const key = Buffer.concat([Buffer.from([0x02]), pubkey]);
+    const value = Buffer.concat([Buffer.from("3006020101020101", "hex"), Buffer.from([spec.sighash])]);
+    entries.push(encodeMapEntry(key, value));
+    return Buffer.concat([...entries, Buffer.from([0x00])]);
+  });
+  const outputMaps = outputs.map(() => Buffer.from([0x00]));
+  return Buffer.concat([PSBT_MAGIC, globalMap, ...inputMaps, ...outputMaps]).toString("base64");
+}
+
+test("[BD1] postBid derives unit price (floor(T/N)) + persists open remainder", async () => {
+  const { service } = makeService({});
+  const bid = await service.postBid({
+    want_spec: { mode: "specific", assets: [range(500, 10)] },
+    bid_target_quantity: 10,
+    bid_total_btc_sats: 10005, // floor(10005/10) = 1000 (residual 5 favors bidder)
+  });
+  assert.equal(bid.offer_kind, "bid");
+  assert.equal(bid.status, "open");
+  assert.equal(bid.bid_target_quantity, 10);
+  assert.equal(bid.bid_total_btc_sats, 10005);
+  assert.equal(bid.bid_remaining_quantity, 10);
+
+  // target < 1 and total < target are rejected.
+  await assert.rejects(
+    service.postBid({ want_spec: { mode: "specific", assets: [range(500, 10)] }, bid_target_quantity: 0, bid_total_btc_sats: 10 }),
+    ListingValidationError,
+  );
+  await assert.rejects(
+    service.postBid({ want_spec: { mode: "specific", assets: [range(500, 10)] }, bid_target_quantity: 10, bid_total_btc_sats: 9 }),
+    ListingValidationError,
+  );
+});
+
+test("[BD2] buildBidFill partial k<N: output 2 = k*unit_price, output 1 = seller postage; submit debits remainder by logical k, rotates nonce, bid stays open", async () => {
+  const { service } = makeService(bidFillOrdOutputs(500));
+  const bid = await service.postBid({
+    want_spec: { mode: "specific", assets: [range(500, 10)] },
+    bid_target_quantity: 10,
+    bid_total_btc_sats: 10000, // unit_price = 1000
+  });
+
+  const built = await service.buildBidFill(bid.offer_id, buildFillRequest(range(500, 4)));
+  assert.ok(built.psbt_base64.length > 0);
+  assert.ok(built.fill_id);
+  // output 2 pays k*unit_price = 4000; output 1 carries the postage value (546).
+  assert.equal(built.output_values[2], 4000);
+  assert.equal(built.output_values[1], SELLER_POSTAGE);
+
+  const before = service.getBid(bid.offer_id)!;
+  const updated = await service.submitBidFill(bid.offer_id, {
+    fill_id: built.fill_id,
+    fill_psbt: buildCoSignedFillPsbt(4000),
+    nonce: before.nonce,
+  });
+  assert.equal(updated.status, "open");
+  assert.equal(updated.bid_remaining_quantity, 6); // 10 - 4
+  assert.notEqual(updated.nonce, before.nonce); // nonce rotated
+});
+
+test("[BD2] single-sat fill debits by exactly 1 even though output 1 carries postage sats", async () => {
+  const { service } = makeService(bidFillOrdOutputs(777));
+  const bid = await service.postBid({
+    want_spec: { mode: "specific", assets: [sat(777, BID_SELLER_OP)] },
+    bid_target_quantity: 3,
+    bid_total_btc_sats: 3000, // unit_price = 1000
+  });
+  const built = await service.buildBidFill(
+    bid.offer_id,
+    buildFillRequest({ asset_type: "sat", asset_outpoint: BID_SELLER_OP, sat_number: 777 }),
+  );
+  assert.equal(built.output_values[2], 1000); // k=1 -> unit_price
+  assert.equal(built.output_values[1], SELLER_POSTAGE);
+  const before = service.getBid(bid.offer_id)!;
+  const updated = await service.submitBidFill(bid.offer_id, {
+    fill_id: built.fill_id,
+    fill_psbt: buildCoSignedFillPsbt(1000),
+    nonce: before.nonce,
+  });
+  assert.equal(updated.bid_remaining_quantity, 2); // debited by 1, not by 546
+});
+
+test("[BD3] fills summing to N transition the bid to filled", async () => {
+  const outs = bidFillOrdOutputs(500);
+  const { service } = makeService(outs);
+  const bid = await service.postBid({
+    want_spec: { mode: "specific", assets: [range(500, 10)] },
+    bid_target_quantity: 10,
+    bid_total_btc_sats: 10000,
+  });
+
+  // Fill 1: [500,506) k=6.
+  const b1 = await service.buildBidFill(bid.offer_id, buildFillRequest(range(500, 6)));
+  let cur = service.getBid(bid.offer_id)!;
+  await service.submitBidFill(bid.offer_id, { fill_id: b1.fill_id, fill_psbt: buildCoSignedFillPsbt(6000), nonce: cur.nonce });
+
+  // Fill 2: [506,510) k=4 -> remainder hits 0 -> filled.
+  const b2 = await service.buildBidFill(bid.offer_id, buildFillRequest(range(506, 4)));
+  cur = service.getBid(bid.offer_id)!;
+  const done = await service.submitBidFill(bid.offer_id, { fill_id: b2.fill_id, fill_psbt: buildCoSignedFillPsbt(4000), nonce: cur.nonce });
+  assert.equal(done.status, "filled");
+  assert.equal(done.bid_remaining_quantity, 0);
+});
+
+test("[BD4] over-fill (k > remaining) is rejected at build time", async () => {
+  const { service } = makeService(bidFillOrdOutputs(500));
+  const bid = await service.postBid({
+    want_spec: { mode: "specific", assets: [range(500, 10)] },
+    bid_target_quantity: 10,
+    bid_total_btc_sats: 10000,
+  });
+  // want range is only size 10; a size-20 delivered range exceeds remaining.
+  await assert.rejects(
+    service.buildBidFill(bid.offer_id, buildFillRequest(range(500, 20))),
+    ListingValidationError,
+  );
+});
+
+test("[BD6] fill failing the want (out-of-range / predicate) is rejected", async () => {
+  const { service } = makeService(bidFillOrdOutputs(2000));
+  const bid = await service.postBid({
+    want_spec: { mode: "specific", assets: [range(500, 10)] },
+    bid_target_quantity: 10,
+    bid_total_btc_sats: 10000,
+  });
+  // Delivered range [2000,2004) is not contained in wanted [500,510).
+  await assert.rejects(
+    service.buildBidFill(bid.offer_id, buildFillRequest(range(2000, 4))),
+    ListingValidationError,
+  );
+});
+
+test("[BD8] strict subrange fully contained debits by delivered size; overlapping second fill rejected", async () => {
+  const { service } = makeService(bidFillOrdOutputs(500));
+  const bid = await service.postBid({
+    want_spec: { mode: "specific", assets: [range(500, 10)] },
+    bid_target_quantity: 10,
+    bid_total_btc_sats: 10000,
+  });
+  const b1 = await service.buildBidFill(bid.offer_id, buildFillRequest(range(502, 3)));
+  let cur = service.getBid(bid.offer_id)!;
+  const after1 = await service.submitBidFill(bid.offer_id, { fill_id: b1.fill_id, fill_psbt: buildCoSignedFillPsbt(3000), nonce: cur.nonce });
+  assert.equal(after1.bid_remaining_quantity, 7); // debited by delivered size 3, not wanted size 10
+
+  // A second fill overlapping [502,505) is rejected by the want matcher.
+  await assert.rejects(
+    service.buildBidFill(bid.offer_id, buildFillRequest(range(503, 2))),
+    ListingValidationError,
+  );
+});
+
+test("[BD7] findCandidateHolders skips null-satpoint sats and errors when indexes are off", async () => {
+  const store = new SqliteListingStore(new DatabaseSync(":memory:"));
+  let offerSeq = 0;
+  let nonceSeq = 0;
+  const satByNumber: Record<number, OrdSat> = {
+    100: { satpoint: "aa".repeat(32) + ":0:0", address: "tb1qholder100" } as OrdSat,
+    200: { satpoint: null, address: null } as OrdSat,
+  };
+  const baseStatus: OrdStatus = { sat_index: true, address_index: true } as OrdStatus;
+  let statusValue = baseStatus;
+  const ordClient = {
+    status: async () => statusValue,
+    sat: async (n: number | bigint) => satByNumber[Number(n)] ?? ({ satpoint: null, address: null } as OrdSat),
+    output: async () => {
+      throw new Error("unused");
+    },
+  } as unknown as ListingOrdClient;
+  const service = new OfferService({
+    store,
+    ordClient,
+    now: () => new Date(NOW),
+    createOfferId: () => `offer-${++offerSeq}`,
+    createNonce: () => `nonce-${++nonceSeq}`,
+  });
+  const bid = await service.postBid({
+    want_spec: { mode: "specific", assets: [sat(100), sat(200)] },
+    bid_target_quantity: 2,
+    bid_total_btc_sats: 2000,
+  });
+  const holders = await service.findCandidateHolders(bid.offer_id);
+  assert.equal(holders.length, 1);
+  assert.equal(holders[0].sat_number, 100);
+  assert.equal(holders[0].address, "tb1qholder100");
+
+  // Indexes off -> error.
+  statusValue = { sat_index: false, address_index: false } as OrdStatus;
+  await assert.rejects(service.findCandidateHolders(bid.offer_id), ListingValidationError);
 });

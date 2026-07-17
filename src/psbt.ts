@@ -62,6 +62,14 @@ export interface ParsedPsbtSignature {
   source: PsbtSignatureSource;
   sighashType: number | null;
   sighashAllEquivalent: boolean;
+  /**
+   * True when the signature value is structurally well-formed for its source,
+   * REGARDLESS of which sighash it commits to: a plausible-DER ECDSA partial
+   * signature with a trailing sighash byte, or a 64/65-byte Taproot key
+   * signature. This is the gate used by {@link inputHasValidSignatureWithSighash}
+   * so a 1-byte fake value carrying a `0x83` suffix cannot pass a sighash check.
+   */
+  structurallyValid: boolean;
 }
 
 export interface ParsedPsbtInput {
@@ -411,6 +419,27 @@ export function inputHasSighashAllSignature(input: ParsedPsbtInput): boolean {
 }
 
 /**
+ * True when an input carries at least one STRUCTURALLY VALID signature whose
+ * `sighashType` is in `allowedSighashes`. This is the structural gate for
+ * "is this input actually signed with one of the allowed sighash flags" — it
+ * rejects malformed/one-byte fake values whose trailing byte happens to be an
+ * allowed sighash (e.g. a 1-byte `0x83`), which a bare `sighashType ∈ {...}`
+ * check would wrongly accept. Used for the filler/seller input of a bid fill
+ * (SIGHASH_SINGLE ± ANYONECANPAY).
+ */
+export function inputHasValidSignatureWithSighash(
+  input: ParsedPsbtInput,
+  allowedSighashes: number[],
+): boolean {
+  return input.signatures.some(
+    (signature) =>
+      signature.structurallyValid &&
+      signature.sighashType !== null &&
+      allowedSighashes.includes(signature.sighashType),
+  );
+}
+
+/**
  * Classify a raw PSBT_IN_PARTIAL_SIG (`0x02`) value. A legacy/segwit ECDSA
  * signature is a DER-encoded signature followed by a single sighash byte, so
  * the minimum plausible length is a DER header (`0x30 len`) plus the two
@@ -432,6 +461,7 @@ function classifyPartialSig(value: Buffer): ParsedPsbtSignature {
     source: "partial_sig",
     sighashType,
     sighashAllEquivalent: looksLikeDer && sighashType === 0x01,
+    structurallyValid: looksLikeDer,
   };
 }
 
@@ -444,7 +474,12 @@ function classifyPartialSig(value: Buffer): ParsedPsbtSignature {
  */
 function classifyTapKeySig(value: Buffer): ParsedPsbtSignature {
   if (value.length === 64) {
-    return { source: "tap_key_sig", sighashType: 0x00, sighashAllEquivalent: true };
+    return {
+      source: "tap_key_sig",
+      sighashType: 0x00,
+      sighashAllEquivalent: true,
+      structurallyValid: true,
+    };
   }
   if (value.length === 65) {
     const sighashType = value[64] ?? null;
@@ -452,9 +487,15 @@ function classifyTapKeySig(value: Buffer): ParsedPsbtSignature {
       source: "tap_key_sig",
       sighashType,
       sighashAllEquivalent: sighashType === 0x01,
+      structurallyValid: true,
     };
   }
-  return { source: "tap_key_sig", sighashType: null, sighashAllEquivalent: false };
+  return {
+    source: "tap_key_sig",
+    sighashType: null,
+    sighashAllEquivalent: false,
+    structurallyValid: false,
+  };
 }
 
 export function parsePsbt(psbtBase64: string): ParsedPsbt {
@@ -747,4 +788,87 @@ export function validateCanonicalTwoBumpFillPsbt(
 
   const buyerInputCount = parsed.inputs.length - 1;
   return { sellerInputIndex, buyerInputCount };
+}
+
+/**
+ * Validate a CO-SIGNED (but not-yet-finalized) bid-fill PSBT (ADR-0019, WS-D).
+ *
+ * Wraps {@link validateCanonicalTwoBumpFillPsbt} for the structural invariants
+ * (seller input at index 2, output 2 == `priceSats` = k×unit_price, dust) and
+ * ADDITIONALLY, via {@link parsePsbt}, checks signatures + the asset-postage
+ * output:
+ * - input 2 (the filler/seller sat UTXO) must carry a STRUCTURALLY VALID
+ *   partial signature with a SIGHASH_SINGLE(±ANYONECANPAY) flag (0x03/0x83);
+ * - every bidder-owned input (indices 0,1 bumps + 3+ funding) must carry a
+ *   structurally valid SIGHASH_ALL/Taproot-default signature;
+ * - output 1 must pay `sellerUtxoValueSats` (the asset postage carried through
+ *   at the seller UTXO's own value — NOT the logical filled_quantity) to
+ *   `buyerAssetScriptPubkeyHex` (the bidder's ordinals destination).
+ *
+ * Throws {@link PsbtValidationError} (or {@link DustValidationError} via the
+ * wrapped canonical check) on any failure so the server maps it to HTTP 400.
+ */
+export function validateBidFillPsbt(
+  fillPsbtBase64: string,
+  sellerOutpoint: string,
+  priceSats: number,
+  buyerAssetScriptPubkeyHex: string,
+  sellerUtxoValueSats: number,
+  dustPolicy: DustPolicy = {},
+): { sellerInputIndex: number; buyerInputCount: number } {
+  // Structure first (reuses the same seller-input/output-2/dust invariants; the
+  // fill's listingPriceSats is the k×unit_price payout).
+  const structural = validateCanonicalTwoBumpFillPsbt(
+    fillPsbtBase64,
+    sellerOutpoint,
+    priceSats,
+    dustPolicy,
+  );
+
+  const parsed = parsePsbt(fillPsbtBase64);
+
+  const sellerInput = parsed.inputs[2];
+  if (!sellerInput) {
+    throw new PsbtValidationError("bid fill PSBT missing seller input at index 2");
+  }
+  // (a) Filler/seller input: SIGHASH_SINGLE ± ANYONECANPAY (0x03/0x83), and the
+  // signature value must be STRUCTURALLY valid (not a 1-byte fake with a 0x83
+  // suffix).
+  if (!inputHasValidSignatureWithSighash(sellerInput, [0x03, 0x83])) {
+    throw new PsbtValidationError(
+      "bid fill input 2 must carry a valid filler signature (SIGHASH_SINGLE|ANYONECANPAY, 0x03/0x83)",
+    );
+  }
+
+  // (b) Every bidder-owned input (bumps 0,1 + funding 3+) must be SIGHASH_ALL.
+  for (let index = 0; index < parsed.inputs.length; index += 1) {
+    if (index === 2) {
+      continue;
+    }
+    const input = parsed.inputs[index];
+    if (!input || !inputHasSighashAllSignature(input)) {
+      throw new PsbtValidationError(
+        `bid fill bidder input ${index} must carry a valid SIGHASH_ALL signature`,
+      );
+    }
+  }
+
+  // (c) Output 1 carries the asset postage (seller UTXO value) to the bidder's
+  // ordinals destination.
+  const assetOutput = parsed.outputs[1];
+  if (!assetOutput) {
+    throw new PsbtValidationError("bid fill PSBT missing asset output at index 1");
+  }
+  if (assetOutput.scriptPubkeyHex !== buyerAssetScriptPubkeyHex) {
+    throw new PsbtValidationError(
+      "bid fill output 1 must pay the bidder's asset destination script",
+    );
+  }
+  if (assetOutput.value !== sellerUtxoValueSats) {
+    throw new PsbtValidationError(
+      "bid fill output 1 value must equal the seller UTXO value (asset postage)",
+    );
+  }
+
+  return structural;
 }
