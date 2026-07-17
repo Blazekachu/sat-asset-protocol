@@ -16,6 +16,7 @@
 import { evaluateCollectionPredicate } from "./collections.ts";
 import { ListingValidationError } from "./listing-service.ts";
 import type {
+  BidFillRecord,
   CollectionPredicateType,
   CollectionRecord,
   OfferAssetRef,
@@ -275,6 +276,28 @@ export function assetSpansOverlap(a: OfferAssetRef, b: OfferAssetRef): boolean {
   const sa = assetRefSpan(a);
   const sb = assetRefSpan(b);
   return sa.start < sb.end && sb.start < sa.end;
+}
+
+/**
+ * Turn a persisted `bid_fills` row's delivered-asset columns into an
+ * {@link OfferAssetRef} (sat vs range) for overlap/containment re-checks. Shared
+ * by the store (ledger overlap guard) and the service (fill matcher).
+ */
+export function bidFillAssetRef(fill: BidFillRecord): OfferAssetRef {
+  if (fill.filled_range_start !== null && fill.filled_range_size !== null) {
+    return {
+      asset_type: "range",
+      asset_outpoint: fill.seller_outpoint,
+      sat_number: fill.filled_range_start,
+      sat_range_start: fill.filled_range_start,
+      sat_range_size: fill.filled_range_size,
+    };
+  }
+  return {
+    asset_type: "sat",
+    asset_outpoint: fill.seller_outpoint,
+    sat_number: fill.filled_sat_number ?? 0,
+  };
 }
 
 /**

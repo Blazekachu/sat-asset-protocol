@@ -4,6 +4,7 @@ import {
   assetMatchesRef,
   assetSatisfiesPredicate,
   assetSpansOverlap,
+  bidFillAssetRef,
 } from "./offer-predicates.ts";
 import type {
   AttestationRecord,
@@ -118,25 +119,6 @@ function mapBidFillRow(row: Record<string, unknown>): BidFillRecord {
     state: String(row.state) as BidFillState,
     created_at:
       row.created_at === null || row.created_at === undefined ? null : String(row.created_at),
-  };
-}
-
-// Turn a persisted bid_fills row's delivered-asset columns into an
-// OfferAssetRef (sat vs range) for the overlap/containment re-check.
-function bidFillAssetRef(fill: BidFillRecord): OfferAssetRef {
-  if (fill.filled_range_start !== null && fill.filled_range_size !== null) {
-    return {
-      asset_type: "range",
-      asset_outpoint: fill.seller_outpoint,
-      sat_number: fill.filled_range_start,
-      sat_range_start: fill.filled_range_start,
-      sat_range_size: fill.filled_range_size,
-    };
-  }
-  return {
-    asset_type: "sat",
-    asset_outpoint: fill.seller_outpoint,
-    sat_number: fill.filled_sat_number ?? 0,
   };
 }
 

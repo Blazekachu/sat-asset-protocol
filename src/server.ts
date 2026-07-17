@@ -143,6 +143,24 @@ function ensureNonEmptyString(value: unknown, fieldName: string): string {
   return value;
 }
 
+// Tri-state parse for an optional `expires_at` body field: `undefined` (absent →
+// leave unchanged), `null` (explicit no-expiry), or a non-empty ISO string.
+function parseOptionalExpiresAt(value: unknown): string | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+  return ensureNonEmptyString(value, "expires_at");
+}
+
+// Optional non-negative integer body field: `undefined` when absent, otherwise
+// a validated integer.
+function parseOptionalInteger(value: unknown, fieldName: string): number | undefined {
+  return value === undefined ? undefined : ensureInteger(value, fieldName);
+}
+
 function parseTemplateInputArray(value: unknown, fieldName: string): TemplateInputPayload[] {
   if (!Array.isArray(value)) {
     throw new ListingValidationError(`${fieldName} must be an array`);
@@ -796,12 +814,7 @@ export function createApp(dependencies: AppDependencies): AppInstance {
           const request_: PostIntentRequest = {
             give_assets: parseOfferAssetRefArray(body.give_assets, "give_assets"),
             want_spec: parseWantSpec(body.want_spec, "want_spec"),
-            expires_at:
-              body.expires_at === undefined
-                ? undefined
-                : body.expires_at === null
-                  ? null
-                  : ensureNonEmptyString(body.expires_at, "expires_at"),
+            expires_at: parseOptionalExpiresAt(body.expires_at),
           };
           const offer = await offerService.postIntent(request_);
           writeJson(response, 201, { offer });
@@ -829,12 +842,7 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             const request_: RespondToIntentRequest = {
               taker_assets: parseOfferAssetRefArray(body.taker_assets, "taker_assets"),
               taker_build: parseSideBuildData(body.taker_build, "taker_build"),
-              expires_at:
-                body.expires_at === undefined
-                  ? undefined
-                  : body.expires_at === null
-                    ? null
-                    : ensureNonEmptyString(body.expires_at, "expires_at"),
+              expires_at: parseOptionalExpiresAt(body.expires_at),
             };
             const offer = await offerService.respondToIntent(offerId, request_);
             writeJson(response, 201, { offer });
@@ -863,10 +871,10 @@ export function createApp(dependencies: AppDependencies): AppInstance {
                 body.fee_payer_change_value_sats,
                 "fee_payer_change_value_sats",
               ),
-              max_fee_rate_sat_per_vb:
-                body.max_fee_rate_sat_per_vb === undefined
-                  ? undefined
-                  : ensureInteger(body.max_fee_rate_sat_per_vb, "max_fee_rate_sat_per_vb"),
+              max_fee_rate_sat_per_vb: parseOptionalInteger(
+                body.max_fee_rate_sat_per_vb,
+                "max_fee_rate_sat_per_vb",
+              ),
             };
             const built = await offerService.buildConcreteOffer(offerId, request_);
             writeJson(response, 200, {
@@ -925,12 +933,7 @@ export function createApp(dependencies: AppDependencies): AppInstance {
                 body.want_spec === undefined
                   ? undefined
                   : parseWantSpec(body.want_spec, "want_spec"),
-              expires_at:
-                body.expires_at === undefined
-                  ? undefined
-                  : body.expires_at === null
-                    ? null
-                    : ensureNonEmptyString(body.expires_at, "expires_at"),
+              expires_at: parseOptionalExpiresAt(body.expires_at),
             };
             const offer = await offerService.counterOffer(offerId, request_);
             writeJson(response, 201, { offer });
@@ -1026,12 +1029,7 @@ export function createApp(dependencies: AppDependencies): AppInstance {
               "bid_target_quantity",
             ),
             bid_total_btc_sats: ensureInteger(body.bid_total_btc_sats, "bid_total_btc_sats"),
-            expires_at:
-              body.expires_at === undefined
-                ? undefined
-                : body.expires_at === null
-                  ? null
-                  : ensureNonEmptyString(body.expires_at, "expires_at"),
+            expires_at: parseOptionalExpiresAt(body.expires_at),
           };
           const bid = await offerService.postBid(request_);
           writeJson(response, 201, { bid });
@@ -1095,10 +1093,10 @@ export function createApp(dependencies: AppDependencies): AppInstance {
                 body.fee_payer_change_value_sats,
                 "fee_payer_change_value_sats",
               ),
-              max_fee_rate_sat_per_vb:
-                body.max_fee_rate_sat_per_vb === undefined
-                  ? undefined
-                  : ensureInteger(body.max_fee_rate_sat_per_vb, "max_fee_rate_sat_per_vb"),
+              max_fee_rate_sat_per_vb: parseOptionalInteger(
+                body.max_fee_rate_sat_per_vb,
+                "max_fee_rate_sat_per_vb",
+              ),
             };
             const built = await offerService.buildBidFill(bidId, request_);
             writeJson(response, 200, {

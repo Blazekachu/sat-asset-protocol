@@ -46,6 +46,7 @@ import type {
 import {
   assetRefSpan,
   assetSatisfiesPredicate,
+  bidFillAssetRef,
   bidFillMatchesWant,
   normalizeAssetRef,
   normalizeWantSpec,
@@ -62,10 +63,8 @@ import {
   type SatForSatAssetLeg,
 } from "./sat-for-sat-bundle.ts";
 import {
-  buildSatForSatOfferPsbt,
   validateSatForSatAcceptPsbt,
   validateSatForSatOfferPsbt,
-  type SatForSatAssetSide,
 } from "./sat-for-sat.ts";
 
 /**
@@ -444,35 +443,9 @@ export class OfferService {
 
     const dustPolicy = this.#buildDustPolicy(input.max_fee_rate_sat_per_vb);
 
-    if (giveAssets.length === 1 && takerAssets.length === 1) {
-      const partyA: SatForSatAssetSide = {
-        bumpInput: offererBumpInputs[0],
-        assetInput: offererAssetInputs[0],
-        changeScriptPubkeyHex: offererBuild.change_script_pubkey_hex,
-        counterpartyOrdinalsScriptPubkeyHex: takerBuild.ordinals_script_pubkey_hex,
-      };
-      const partyB: SatForSatAssetSide = {
-        bumpInput: takerBumpInputs[0],
-        assetInput: takerAssetInputs[0],
-        changeScriptPubkeyHex: takerBuild.change_script_pubkey_hex,
-        counterpartyOrdinalsScriptPubkeyHex: offererBuild.ordinals_script_pubkey_hex,
-      };
-      const result = buildSatForSatOfferPsbt({
-        partyA,
-        partyB,
-        feeFundingInput,
-        feePayerChangeScriptPubkeyHex: feePayerChangeScriptPubkeyHex,
-        feePayerChangeValueSats,
-        dustPolicy,
-      });
-      return {
-        psbt_base64: result.psbtBase64,
-        input_outpoints: result.inputOutpoints,
-        output_values: result.outputValues,
-      };
-    }
-
-    // Bundle path (RD4).
+    // General m×n bundle path (RD4). The single-asset case (m=n=1) is just a
+    // one-leg-per-side bundle: buildSatForSatOfferPsbt itself delegates here
+    // byte-identically, so there is no need for a separate branch.
     const offererLegs: SatForSatAssetLeg[] = giveAssets.map((_asset, index) => ({
       bumpInput: offererBumpInputs[index],
       assetInput: offererAssetInputs[index],
@@ -833,7 +806,7 @@ export class OfferService {
     const alreadyFilled = this.#store
       .listBidFills(bidId)
       .filter((fill) => fill.state === "reserved" || fill.state === "settled")
-      .map((fill) => this.#bidFillAssetRef(fill));
+      .map((fill) => bidFillAssetRef(fill));
     bidFillMatchesWant(spec, sellerAsset, alreadyFilled);
 
     // Logical fill quantity k derived from the DELIVERED asset (not want_spec).
@@ -959,7 +932,7 @@ export class OfferService {
       ),
     );
 
-    const filledAssetRef = this.#bidFillAssetRef(pending);
+    const filledAssetRef = bidFillAssetRef(pending);
     const nextNonce = this.#createNonce();
     const fillRow: OfferRecord = {
       offer_id: pending.fill_offer_id,
@@ -1009,24 +982,30 @@ export class OfferService {
     this.#loadBid(bidId);
     const settlementTxid = ensureRequiredString(txid, "txid");
     const guardNonce = ensureRequiredString(nonce, "nonce");
-    try {
-      return this.#store.settleBidFill(bidId, fillId, settlementTxid, guardNonce);
-    } catch (error) {
-      throw new ListingValidationError(
-        error instanceof Error ? error.message : "bid fill could not be settled",
-      );
-    }
+    return this.#wrapStoreError(
+      () => this.#store.settleBidFill(bidId, fillId, settlementTxid, guardNonce),
+      "bid fill could not be settled",
+    );
   }
 
   /** Release a reserved fill (recovery): credit the remainder, cancel the child. */
   releaseBidFill(bidId: string, fillId: string, nonce: string): OfferRecord {
     this.#loadBid(bidId);
     const guardNonce = ensureRequiredString(nonce, "nonce");
+    return this.#wrapStoreError(
+      () => this.#store.releaseBidFill(bidId, fillId, guardNonce),
+      "bid fill could not be released",
+    );
+  }
+
+  // Run a store mutation, re-wrapping the plain `Error`s it throws for
+  // CAS/guard failures as ListingValidationError (→ HTTP 400).
+  #wrapStoreError<T>(fn: () => T, fallbackMessage: string): T {
     try {
-      return this.#store.releaseBidFill(bidId, fillId, guardNonce);
+      return fn();
     } catch (error) {
       throw new ListingValidationError(
-        error instanceof Error ? error.message : "bid fill could not be released",
+        error instanceof Error ? error.message : fallbackMessage,
       );
     }
   }
@@ -1061,25 +1040,6 @@ export class OfferService {
       throw new OfferNotFoundError("bid not found");
     }
     return this.#lazyExpire(bid);
-  }
-
-  // Turn a persisted bid_fills row's delivered-asset columns into an
-  // OfferAssetRef for overlap checks.
-  #bidFillAssetRef(fill: BidFillRecord): OfferAssetRef {
-    if (fill.filled_range_start !== null && fill.filled_range_size !== null) {
-      return {
-        asset_type: "range",
-        asset_outpoint: fill.seller_outpoint,
-        sat_number: fill.filled_range_start,
-        sat_range_start: fill.filled_range_start,
-        sat_range_size: fill.filled_range_size,
-      };
-    }
-    return {
-      asset_type: "sat",
-      asset_outpoint: fill.seller_outpoint,
-      sat_number: fill.filled_sat_number ?? 0,
-    };
   }
 
   // Report (and persist opportunistically) an open, past-expiry round as
