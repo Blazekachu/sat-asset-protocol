@@ -1,14 +1,20 @@
 import { DatabaseSync } from "node:sqlite";
 
+import { assetMatchesRef, assetSatisfiesPredicate } from "./offer-predicates.ts";
 import type {
   AttestationRecord,
   CollectionRecord,
+  IntentQuery,
   ListingQuery,
   ListingRecord,
   ListingStore,
+  OfferAssetRef,
+  OfferKind,
   OfferQuery,
   OfferRecord,
   OfferStatus,
+  SideBuildData,
+  WantSpec,
 } from "./listing-types.ts";
 
 function mapListingRow(row: Record<string, unknown>): ListingRecord {
@@ -34,20 +40,84 @@ function mapListingRow(row: Record<string, unknown>): ListingRecord {
   };
 }
 
+function parseJsonColumn<T>(value: unknown): T | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return JSON.parse(String(value)) as T;
+}
+
+function nullableNumber(value: unknown): number | null {
+  return value === null || value === undefined ? null : Number(value);
+}
+
 function mapOfferRow(row: Record<string, unknown>): OfferRecord {
   return {
     offer_id: String(row.offer_id),
     offerer_sat_number: Number(row.offerer_sat_number),
     offerer_asset_outpoint: String(row.offerer_asset_outpoint),
-    taker_sat_number: Number(row.taker_sat_number),
-    taker_asset_outpoint: String(row.taker_asset_outpoint),
-    offer_psbt: String(row.offer_psbt),
+    taker_sat_number: nullableNumber(row.taker_sat_number),
+    taker_asset_outpoint:
+      row.taker_asset_outpoint === null || row.taker_asset_outpoint === undefined
+        ? null
+        : String(row.taker_asset_outpoint),
+    offer_psbt: row.offer_psbt === null || row.offer_psbt === undefined ? null : String(row.offer_psbt),
     accept_psbt: row.accept_psbt === null ? null : String(row.accept_psbt),
     status: String(row.status) as OfferStatus,
     created_at: String(row.created_at),
     expires_at: row.expires_at === null ? null : String(row.expires_at),
+    offer_kind: String(row.offer_kind) as OfferKind,
+    negotiation_id: String(row.negotiation_id),
+    parent_offer_id:
+      row.parent_offer_id === null || row.parent_offer_id === undefined
+        ? null
+        : String(row.parent_offer_id),
+    counter_index: Number(row.counter_index),
+    supersedes:
+      row.supersedes === null || row.supersedes === undefined ? null : String(row.supersedes),
+    nonce: String(row.nonce),
+    give_assets: parseJsonColumn<OfferAssetRef[]>(row.give_assets_json),
+    want_spec: parseJsonColumn<WantSpec>(row.want_spec_json),
+    taker_assets: parseJsonColumn<OfferAssetRef[]>(row.taker_assets_json),
+    taker_build: parseJsonColumn<SideBuildData>(row.taker_build_json),
+    settlement_txid:
+      row.settlement_txid === null || row.settlement_txid === undefined
+        ? null
+        : String(row.settlement_txid),
+    bid_target_quantity: nullableNumber(row.bid_target_quantity),
+    bid_total_btc_sats: nullableNumber(row.bid_total_btc_sats),
+    bid_remaining_quantity: nullableNumber(row.bid_remaining_quantity),
   };
 }
+
+// Full column list for offers_v2 SELECTs (order-independent; mapOfferRow reads
+// by name).
+const OFFER_COLUMNS = `
+  offer_id,
+  offerer_sat_number,
+  offerer_asset_outpoint,
+  taker_sat_number,
+  taker_asset_outpoint,
+  offer_psbt,
+  accept_psbt,
+  status,
+  created_at,
+  expires_at,
+  offer_kind,
+  negotiation_id,
+  parent_offer_id,
+  counter_index,
+  supersedes,
+  nonce,
+  give_assets_json,
+  want_spec_json,
+  taker_assets_json,
+  taker_build_json,
+  settlement_txid,
+  bid_target_quantity,
+  bid_total_btc_sats,
+  bid_remaining_quantity
+`;
 
 export class SqliteListingStore implements ListingStore {
   readonly #database: DatabaseSync;
@@ -105,6 +175,7 @@ export class SqliteListingStore implements ListingStore {
     `);
 
     this.#migrateListingRangeColumns();
+    this.#migrateOffersTable();
 
     this.#database.exec(`
       CREATE INDEX IF NOT EXISTS listings_open_sat_number_idx
@@ -119,6 +190,152 @@ export class SqliteListingStore implements ListingStore {
         ON offers (taker_sat_number, status);
       CREATE INDEX IF NOT EXISTS offers_offerer_status_idx
         ON offers (offerer_sat_number, status);
+      CREATE INDEX IF NOT EXISTS offers_kind_status_idx
+        ON offers (offer_kind, status);
+      CREATE INDEX IF NOT EXISTS offers_negotiation_idx
+        ON offers (negotiation_id, counter_index);
+      CREATE INDEX IF NOT EXISTS offers_nonce_idx
+        ON offers (nonce);
+      CREATE INDEX IF NOT EXISTS bid_fills_bid_idx
+        ON bid_fills (bid_id);
+    `);
+  }
+
+  // Idempotent migration to the negotiation-model offers schema (ADR-0016/0017)
+  // AND the WS-D bid schema (ADR-0019), built in ONE pass so WS-D never has to
+  // rebuild the table. The legacy `offers` table declared NOT NULL on
+  // taker_sat_number/taker_asset_outpoint/offer_psbt, which intents and
+  // unsigned rounds must relax, so a CREATE ... AS SELECT + DROP + RENAME
+  // rebuild is required (ALTER cannot relax NOT NULL). No-op once migrated.
+  #migrateOffersTable(): void {
+    const existingColumns = new Set(
+      this.#database
+        .prepare("PRAGMA table_info(offers)")
+        .all()
+        .map((row) => String((row as Record<string, unknown>).name)),
+    );
+
+    // The bid_fills ledger is additive; create it regardless (WS-D writes it).
+    this.#database.exec(`
+      CREATE TABLE IF NOT EXISTS bid_fills (
+        fill_id TEXT PRIMARY KEY,
+        bid_id TEXT NOT NULL,
+        fill_offer_id TEXT NOT NULL,
+        filled_sat_number INTEGER,
+        filled_range_start INTEGER,
+        filled_range_size INTEGER,
+        filled_quantity INTEGER NOT NULL,
+        seller_outpoint TEXT,
+        seller_utxo_value_sats INTEGER,
+        buyer_asset_script_pubkey_hex TEXT,
+        price_sats INTEGER,
+        state TEXT NOT NULL,
+        created_at TEXT
+      );
+    `);
+
+    if (existingColumns.has("offer_kind")) {
+      // Already migrated.
+      return;
+    }
+
+    // Build the complete final schema (WS-A + WS-D columns) in offers_v2, copy
+    // legacy rows as concrete offers, then swap it in.
+    this.#database.exec(`
+      CREATE TABLE offers_v2 (
+        offer_id TEXT PRIMARY KEY,
+        offerer_sat_number INTEGER NOT NULL,
+        offerer_asset_outpoint TEXT NOT NULL,
+        taker_sat_number INTEGER,
+        taker_asset_outpoint TEXT,
+        offer_psbt TEXT,
+        accept_psbt TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at TEXT NOT NULL,
+        expires_at TEXT,
+        offer_kind TEXT NOT NULL DEFAULT 'concrete',
+        negotiation_id TEXT NOT NULL,
+        parent_offer_id TEXT,
+        counter_index INTEGER NOT NULL DEFAULT 0,
+        supersedes TEXT,
+        nonce TEXT NOT NULL,
+        give_assets_json TEXT,
+        want_spec_json TEXT,
+        taker_assets_json TEXT,
+        taker_build_json TEXT,
+        settlement_txid TEXT,
+        bid_target_quantity INTEGER,
+        bid_total_btc_sats INTEGER,
+        bid_remaining_quantity INTEGER,
+        bid_want_spec_json TEXT
+      );
+    `);
+
+    // Copy legacy rows only when the legacy table has content to copy. Legacy
+    // rows become concrete offers with negotiation_id=offer_id, counter_index=0,
+    // nonce=offer_id, and all new JSON/settlement/bid cols NULL.
+    if (existingColumns.size > 0) {
+      this.#database.exec(`
+        INSERT INTO offers_v2 (
+          offer_id,
+          offerer_sat_number,
+          offerer_asset_outpoint,
+          taker_sat_number,
+          taker_asset_outpoint,
+          offer_psbt,
+          accept_psbt,
+          status,
+          created_at,
+          expires_at,
+          offer_kind,
+          negotiation_id,
+          parent_offer_id,
+          counter_index,
+          supersedes,
+          nonce,
+          give_assets_json,
+          want_spec_json,
+          taker_assets_json,
+          taker_build_json,
+          settlement_txid,
+          bid_target_quantity,
+          bid_total_btc_sats,
+          bid_remaining_quantity,
+          bid_want_spec_json
+        )
+        SELECT
+          offer_id,
+          offerer_sat_number,
+          offerer_asset_outpoint,
+          taker_sat_number,
+          taker_asset_outpoint,
+          offer_psbt,
+          accept_psbt,
+          status,
+          created_at,
+          expires_at,
+          'concrete',
+          offer_id,
+          NULL,
+          0,
+          NULL,
+          offer_id,
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          NULL
+        FROM offers;
+      `);
+    }
+
+    this.#database.exec(`
+      DROP TABLE offers;
+      ALTER TABLE offers_v2 RENAME TO offers;
     `);
   }
 
@@ -362,56 +579,88 @@ export class SqliteListingStore implements ListingStore {
           accept_psbt,
           status,
           created_at,
-          expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          expires_at,
+          offer_kind,
+          negotiation_id,
+          parent_offer_id,
+          counter_index,
+          supersedes,
+          nonce,
+          give_assets_json,
+          want_spec_json,
+          taker_assets_json,
+          taker_build_json,
+          settlement_txid,
+          bid_target_quantity,
+          bid_total_btc_sats,
+          bid_remaining_quantity,
+          bid_want_spec_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
-      .run(
-        record.offer_id,
-        record.offerer_sat_number,
-        record.offerer_asset_outpoint,
-        record.taker_sat_number,
-        record.taker_asset_outpoint,
-        record.offer_psbt,
-        record.accept_psbt,
-        record.status,
-        record.created_at,
-        record.expires_at,
-      );
+      .run(...this.#offerInsertValues(record));
+  }
+
+  #offerInsertValues(record: OfferRecord): Array<string | number | null> {
+    const jsonOrNull = (value: unknown): string | null =>
+      value === null || value === undefined ? null : JSON.stringify(value);
+    const valueOrNull = <T>(value: T | undefined | null): T | null =>
+      value === undefined || value === null ? null : value;
+
+    // Coalesce the negotiation fields to their legacy defaults when a caller
+    // constructs a bare OfferRecord (e.g. older tests/fixtures that predate the
+    // negotiation model). NOT NULL columns must always receive a value.
+    const offerKind = record.offer_kind ?? "concrete";
+    const negotiationId = record.negotiation_id ?? record.offer_id;
+    const counterIndex = record.counter_index ?? 0;
+    const nonce = record.nonce ?? record.offer_id;
+
+    // A bid stores its want under want_spec; mirror it into bid_want_spec_json
+    // so the WS-D bid path (which reads that column) sees the same spec.
+    const bidWantSpecJson = offerKind === "bid" ? jsonOrNull(record.want_spec) : null;
+
+    return [
+      record.offer_id,
+      record.offerer_sat_number,
+      record.offerer_asset_outpoint,
+      valueOrNull(record.taker_sat_number),
+      valueOrNull(record.taker_asset_outpoint),
+      valueOrNull(record.offer_psbt),
+      valueOrNull(record.accept_psbt),
+      record.status,
+      record.created_at,
+      valueOrNull(record.expires_at),
+      offerKind,
+      negotiationId,
+      valueOrNull(record.parent_offer_id),
+      counterIndex,
+      valueOrNull(record.supersedes),
+      nonce,
+      jsonOrNull(record.give_assets),
+      jsonOrNull(record.want_spec),
+      jsonOrNull(record.taker_assets),
+      jsonOrNull(record.taker_build),
+      valueOrNull(record.settlement_txid),
+      valueOrNull(record.bid_target_quantity),
+      valueOrNull(record.bid_total_btc_sats),
+      valueOrNull(record.bid_remaining_quantity),
+      bidWantSpecJson,
+    ];
   }
 
   getOffer(offerId: string): OfferRecord | null {
     const row = this.#database
-      .prepare(`
-        SELECT
-          offer_id,
-          offerer_sat_number,
-          offerer_asset_outpoint,
-          taker_sat_number,
-          taker_asset_outpoint,
-          offer_psbt,
-          accept_psbt,
-          status,
-          created_at,
-          expires_at
-        FROM offers
-        WHERE offer_id = ?
-        LIMIT 1
-      `)
+      .prepare(`SELECT ${OFFER_COLUMNS} FROM offers WHERE offer_id = ? LIMIT 1`)
       .get(offerId) as Record<string, unknown> | undefined;
 
     return row ? mapOfferRow(row) : null;
   }
 
-  updateOfferAccept(offerId: string, acceptPsbt: string): OfferRecord | null {
-    this.#database
-      .prepare(`
-        UPDATE offers
-        SET accept_psbt = ?, status = 'accepted'
-        WHERE offer_id = ?
-      `)
-      .run(acceptPsbt, offerId);
+  getOfferByNonce(nonce: string): OfferRecord | null {
+    const row = this.#database
+      .prepare(`SELECT ${OFFER_COLUMNS} FROM offers WHERE nonce = ? LIMIT 1`)
+      .get(nonce) as Record<string, unknown> | undefined;
 
-    return this.getOffer(offerId);
+    return row ? mapOfferRow(row) : null;
   }
 
   listOffers(query: OfferQuery = {}): OfferRecord[] {
@@ -433,25 +682,204 @@ export class SqliteListingStore implements ListingStore {
       values.push(query.status);
     }
 
+    if (query.offer_kind !== undefined) {
+      conditions.push("offer_kind = ?");
+      values.push(query.offer_kind);
+    }
+
+    if (query.negotiation_id !== undefined) {
+      conditions.push("negotiation_id = ?");
+      values.push(query.negotiation_id);
+    }
+
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
     const statement = this.#database.prepare(`
-      SELECT
-        offer_id,
-        offerer_sat_number,
-        offerer_asset_outpoint,
-        taker_sat_number,
-        taker_asset_outpoint,
-        offer_psbt,
-        accept_psbt,
-        status,
-        created_at,
-        expires_at
+      SELECT ${OFFER_COLUMNS}
       FROM offers
       ${whereClause}
       ORDER BY created_at DESC, offer_id DESC
     `);
 
     return statement.all(...values).map((row) => mapOfferRow(row as Record<string, unknown>));
+  }
+
+  listIntents(query: IntentQuery = {}): OfferRecord[] {
+    const status = query.status ?? "open";
+    const rows = this.#database
+      .prepare(`
+        SELECT ${OFFER_COLUMNS}
+        FROM offers
+        WHERE offer_kind = 'intent' AND status = ?
+        ORDER BY created_at DESC, offer_id DESC
+      `)
+      .all(status)
+      .map((row) => mapOfferRow(row as Record<string, unknown>));
+
+    if (query.candidate_sat_number === undefined) {
+      return rows;
+    }
+
+    // Post-filter to intents whose want_spec would accept the candidate sat.
+    const candidate: OfferAssetRef = {
+      asset_type: "sat",
+      asset_outpoint: null,
+      sat_number: query.candidate_sat_number,
+    };
+    return rows.filter((offer) => {
+      const spec = offer.want_spec;
+      if (!spec) {
+        return false;
+      }
+      try {
+        if (spec.mode === "predicate") {
+          return assetSatisfiesPredicate(spec.predicate, candidate);
+        }
+        return spec.assets.some((ref) => assetMatchesRef(ref, candidate));
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  listNegotiationThread(negotiationId: string): OfferRecord[] {
+    return this.#database
+      .prepare(`
+        SELECT ${OFFER_COLUMNS}
+        FROM offers
+        WHERE negotiation_id = ?
+        ORDER BY counter_index ASC, created_at ASC
+      `)
+      .all(negotiationId)
+      .map((row) => mapOfferRow(row as Record<string, unknown>));
+  }
+
+  // Atomically insert the child round and CAS the parent open -> countered.
+  // DatabaseSync (node:sqlite) has no db.transaction() helper (verified
+  // typeof db.transaction === "undefined"), so use explicit BEGIN/COMMIT/
+  // ROLLBACK. If the parent CAS changes !== 1, the child is never orphaned.
+  supersedeWithCounter(
+    parentId: string,
+    parentNonce: string,
+    childRow: OfferRecord,
+  ): OfferRecord {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#database
+        .prepare(`
+          INSERT INTO offers (
+            offer_id,
+            offerer_sat_number,
+            offerer_asset_outpoint,
+            taker_sat_number,
+            taker_asset_outpoint,
+            offer_psbt,
+            accept_psbt,
+            status,
+            created_at,
+            expires_at,
+            offer_kind,
+            negotiation_id,
+            parent_offer_id,
+            counter_index,
+            supersedes,
+            nonce,
+            give_assets_json,
+            want_spec_json,
+            taker_assets_json,
+            taker_build_json,
+            settlement_txid,
+            bid_target_quantity,
+            bid_total_btc_sats,
+            bid_remaining_quantity,
+            bid_want_spec_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(...this.#offerInsertValues(childRow));
+
+      const result = this.#database
+        .prepare(`
+          UPDATE offers
+          SET status = 'countered'
+          WHERE offer_id = ? AND nonce = ? AND status = 'open'
+        `)
+        .run(parentId, parentNonce);
+
+      if (Number(result.changes) !== 1) {
+        throw new Error("parent offer is not open under the supplied nonce");
+      }
+
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+
+    const child = this.getOffer(childRow.offer_id);
+    if (!child) {
+      throw new Error("counter round was not persisted");
+    }
+    return child;
+  }
+
+  updateOfferPsbt(offerId: string, offerPsbt: string, nonce: string): OfferRecord | null {
+    const result = this.#database
+      .prepare(`
+        UPDATE offers
+        SET offer_psbt = ?
+        WHERE offer_id = ? AND nonce = ? AND status = 'open' AND offer_psbt IS NULL
+      `)
+      .run(offerPsbt, offerId, nonce);
+
+    return Number(result.changes) === 1 ? this.getOffer(offerId) : null;
+  }
+
+  updateOfferAccept(offerId: string, acceptPsbt: string, nonce: string): OfferRecord | null {
+    const result = this.#database
+      .prepare(`
+        UPDATE offers
+        SET accept_psbt = ?, status = 'accepted'
+        WHERE offer_id = ? AND nonce = ? AND status = 'open' AND offer_psbt IS NOT NULL
+      `)
+      .run(acceptPsbt, offerId, nonce);
+
+    return Number(result.changes) === 1 ? this.getOffer(offerId) : null;
+  }
+
+  settleAcceptedOffer(offerId: string, txid: string, nonce: string): OfferRecord | null {
+    const result = this.#database
+      .prepare(`
+        UPDATE offers
+        SET status = 'settled', settlement_txid = ?
+        WHERE offer_id = ? AND nonce = ? AND status = 'accepted'
+      `)
+      .run(txid, offerId, nonce);
+
+    return Number(result.changes) === 1 ? this.getOffer(offerId) : null;
+  }
+
+  cancelOpenOffer(offerId: string, nonce: string): OfferRecord | null {
+    const result = this.#database
+      .prepare(`
+        UPDATE offers
+        SET status = 'cancelled'
+        WHERE offer_id = ? AND nonce = ? AND status = 'open'
+      `)
+      .run(offerId, nonce);
+
+    return Number(result.changes) === 1 ? this.getOffer(offerId) : null;
+  }
+
+  expireOffer(offerId: string, nowIso: string): OfferRecord | null {
+    const result = this.#database
+      .prepare(`
+        UPDATE offers
+        SET status = 'expired'
+        WHERE offer_id = ? AND status = 'open'
+          AND expires_at IS NOT NULL AND expires_at < ?
+      `)
+      .run(offerId, nowIso);
+
+    return Number(result.changes) === 1 ? this.getOffer(offerId) : null;
   }
 }

@@ -12,7 +12,20 @@ import { loadConfig, type ProtocolConfig } from "./config.ts";
 import { DustValidationError } from "./dust.ts";
 import { ListingService, ListingValidationError, type ListingOrdClient } from "./listing-service.ts";
 import { SqliteListingStore } from "./listing-store.ts";
-import type { CreateListingRequest, CreateOfferRequest, ListingStore } from "./listing-types.ts";
+import type {
+  BuildConcreteOfferRequest,
+  CollectionPredicateType,
+  CounterOfferRequest,
+  CreateListingRequest,
+  CreateOfferRequest,
+  ListingStore,
+  OfferAssetRef,
+  PostIntentRequest,
+  RespondToIntentRequest,
+  SideBuildData,
+  SubmitOfferPsbtRequest,
+  WantSpec,
+} from "./listing-types.ts";
 import { OfferNotFoundError, OfferService } from "./offer-service.ts";
 import {
   buildBuyerFillTemplatePsbt,
@@ -43,6 +56,7 @@ export interface AppDependencies {
   now?: () => Date;
   createListingId?: () => string;
   createOfferId?: () => string;
+  createNonce?: () => string;
   config?: ProtocolConfig;
 }
 
@@ -226,6 +240,119 @@ function parseSatForSatSide(value: unknown, fieldName: string): SatForSatAssetSi
   };
 }
 
+const OFFER_STATUSES = [
+  "open",
+  "countered",
+  "accepted",
+  "cancelled",
+  "expired",
+  "settled",
+  "filled",
+] as const;
+
+function parseOfferStatus(value: string): (typeof OFFER_STATUSES)[number] {
+  if (!(OFFER_STATUSES as readonly string[]).includes(value)) {
+    throw new ListingValidationError(
+      `status query param must be one of ${OFFER_STATUSES.join(", ")}`,
+    );
+  }
+  return value as (typeof OFFER_STATUSES)[number];
+}
+
+function parseOptionalIntArray(value: unknown, fieldName: string): number[] | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new ListingValidationError(`${fieldName} must be an array`);
+  }
+  return value.map((entry, index) => ensureInteger(entry, `${fieldName}[${index}]`));
+}
+
+function parseOfferAssetRef(value: unknown, fieldName: string): OfferAssetRef {
+  if (!value || typeof value !== "object") {
+    throw new ListingValidationError(`${fieldName} must be an object`);
+  }
+  const raw = value as Record<string, unknown>;
+  const assetType = raw.asset_type;
+  if (assetType !== "sat" && assetType !== "range") {
+    throw new ListingValidationError(`${fieldName}.asset_type must be "sat" or "range"`);
+  }
+  const outpoint =
+    raw.asset_outpoint === null || raw.asset_outpoint === undefined
+      ? null
+      : ensureNonEmptyString(raw.asset_outpoint, `${fieldName}.asset_outpoint`);
+
+  const ref: OfferAssetRef = { asset_type: assetType, asset_outpoint: outpoint };
+  if (assetType === "sat") {
+    ref.sat_number = ensureInteger(raw.sat_number, `${fieldName}.sat_number`);
+  } else {
+    ref.sat_range_start = ensureInteger(raw.sat_range_start, `${fieldName}.sat_range_start`);
+    ref.sat_range_size = ensureInteger(raw.sat_range_size, `${fieldName}.sat_range_size`);
+  }
+  return ref;
+}
+
+function parseOfferAssetRefArray(value: unknown, fieldName: string): OfferAssetRef[] {
+  if (!Array.isArray(value)) {
+    throw new ListingValidationError(`${fieldName} must be an array`);
+  }
+  return value.map((entry, index) => parseOfferAssetRef(entry, `${fieldName}[${index}]`));
+}
+
+function parseWantSpec(value: unknown, fieldName: string): WantSpec {
+  if (!value || typeof value !== "object") {
+    throw new ListingValidationError(`${fieldName} must be an object`);
+  }
+  const raw = value as Record<string, unknown>;
+  if (raw.mode === "specific") {
+    return { mode: "specific", assets: parseOfferAssetRefArray(raw.assets, `${fieldName}.assets`) };
+  }
+  if (raw.mode === "predicate") {
+    if (!raw.predicate || typeof raw.predicate !== "object") {
+      throw new ListingValidationError(`${fieldName}.predicate must be an object`);
+    }
+    const predicate = raw.predicate as Record<string, unknown>;
+    const type = ensureNonEmptyString(predicate.type, `${fieldName}.predicate.type`);
+    if (!predicate.params || typeof predicate.params !== "object") {
+      throw new ListingValidationError(`${fieldName}.predicate.params must be an object`);
+    }
+    return {
+      mode: "predicate",
+      predicate: {
+        type: type as CollectionPredicateType,
+        params: predicate.params as Record<string, unknown>,
+      },
+      count: ensureInteger(raw.count, `${fieldName}.count`),
+    };
+  }
+  throw new ListingValidationError(`${fieldName}.mode must be "specific" or "predicate"`);
+}
+
+function parseSideBuildData(value: unknown, fieldName: string): SideBuildData {
+  if (!value || typeof value !== "object") {
+    throw new ListingValidationError(`${fieldName} must be an object`);
+  }
+  const raw = value as Record<string, unknown>;
+  if (!Array.isArray(raw.bump_outpoints)) {
+    throw new ListingValidationError(`${fieldName}.bump_outpoints must be an array`);
+  }
+  const bumpOutpoints = raw.bump_outpoints.map((entry, index) =>
+    ensureNonEmptyString(entry, `${fieldName}.bump_outpoints[${index}]`),
+  );
+  return {
+    bump_outpoints: bumpOutpoints,
+    change_script_pubkey_hex: ensureNonEmptyString(
+      raw.change_script_pubkey_hex,
+      `${fieldName}.change_script_pubkey_hex`,
+    ),
+    ordinals_script_pubkey_hex: ensureNonEmptyString(
+      raw.ordinals_script_pubkey_hex,
+      `${fieldName}.ordinals_script_pubkey_hex`,
+    ),
+  };
+}
+
 // Rarity ordering, mirroring collections.ts's private rarityRank, used to
 // filter/annotate discovery results by minimum rarity.
 const RARITY_RANK: Record<string, number> = {
@@ -310,12 +437,6 @@ export function createApp(dependencies: AppDependencies): AppInstance {
     now: dependencies.now,
     createListingId: dependencies.createListingId,
   });
-  const offerService = new OfferService({
-    store: listingStore,
-    ordClient: dependencies.ordClient,
-    now: dependencies.now,
-    createOfferId: dependencies.createOfferId,
-  });
   const verifyOrdClients = dependencies.verifyOrdClients ?? [dependencies.ordClient as VerifyOrdClient];
   const now = dependencies.now ?? (() => new Date());
   const config = dependencies.config ?? loadConfig();
@@ -323,6 +444,14 @@ export function createApp(dependencies: AppDependencies): AppInstance {
     minRelayFeeSatPerVb: config.minRelayFeeSatPerVb,
     bumpSizeSats: config.bumpSizeSats,
   };
+  const offerService = new OfferService({
+    store: listingStore,
+    ordClient: dependencies.ordClient,
+    now: dependencies.now,
+    createOfferId: dependencies.createOfferId,
+    createNonce: dependencies.createNonce,
+    dustPolicy,
+  });
 
   return {
     handler: async (request, response) => {
@@ -657,6 +786,184 @@ export function createApp(dependencies: AppDependencies): AppInstance {
           return;
         }
 
+        // --- Negotiation model (WS-A) --------------------------------------
+
+        if (method === "POST" && url.pathname === "/v1/sat-for-sat/intents") {
+          const body = (await readJsonBody(request)) as Record<string, unknown>;
+          const request_: PostIntentRequest = {
+            give_assets: parseOfferAssetRefArray(body.give_assets, "give_assets"),
+            want_spec: parseWantSpec(body.want_spec, "want_spec"),
+            expires_at:
+              body.expires_at === undefined
+                ? undefined
+                : body.expires_at === null
+                  ? null
+                  : ensureNonEmptyString(body.expires_at, "expires_at"),
+          };
+          const offer = await offerService.postIntent(request_);
+          writeJson(response, 201, { offer });
+          return;
+        }
+
+        if (method === "GET" && url.pathname === "/v1/sat-for-sat/intents") {
+          const statusText = url.searchParams.get("status");
+          const candidateSat = parseOptionalIntQueryParam(url, "candidate_sat");
+          const intents = offerService.listIntents({
+            status: statusText === null || statusText.trim() === "" ? undefined : parseOfferStatus(statusText),
+            candidate_sat_number: candidateSat,
+          });
+          writeJson(response, 200, { intents });
+          return;
+        }
+
+        {
+          const respondMatch = url.pathname.match(
+            /^\/v1\/sat-for-sat\/intents\/([^/]+)\/respond$/,
+          );
+          if (method === "POST" && respondMatch) {
+            const offerId = decodeURIComponent(respondMatch[1] ?? "");
+            const body = (await readJsonBody(request)) as Record<string, unknown>;
+            const request_: RespondToIntentRequest = {
+              taker_assets: parseOfferAssetRefArray(body.taker_assets, "taker_assets"),
+              taker_build: parseSideBuildData(body.taker_build, "taker_build"),
+              expires_at:
+                body.expires_at === undefined
+                  ? undefined
+                  : body.expires_at === null
+                    ? null
+                    : ensureNonEmptyString(body.expires_at, "expires_at"),
+            };
+            const offer = await offerService.respondToIntent(offerId, request_);
+            writeJson(response, 201, { offer });
+            return;
+          }
+        }
+
+        {
+          const buildMatch = url.pathname.match(
+            /^\/v1\/sat-for-sat\/offers\/([^/]+)\/build$/,
+          );
+          if (method === "POST" && buildMatch) {
+            const offerId = decodeURIComponent(buildMatch[1] ?? "");
+            const body = (await readJsonBody(request)) as Record<string, unknown>;
+            const request_: BuildConcreteOfferRequest = {
+              offerer_build: parseSideBuildData(body.offerer_build, "offerer_build"),
+              fee_funding_outpoint: ensureNonEmptyString(
+                body.fee_funding_outpoint,
+                "fee_funding_outpoint",
+              ),
+              fee_payer_change_script_pubkey_hex: ensureNonEmptyString(
+                body.fee_payer_change_script_pubkey_hex,
+                "fee_payer_change_script_pubkey_hex",
+              ),
+              fee_payer_change_value_sats: ensureInteger(
+                body.fee_payer_change_value_sats,
+                "fee_payer_change_value_sats",
+              ),
+              max_fee_rate_sat_per_vb:
+                body.max_fee_rate_sat_per_vb === undefined
+                  ? undefined
+                  : ensureInteger(body.max_fee_rate_sat_per_vb, "max_fee_rate_sat_per_vb"),
+            };
+            const built = await offerService.buildConcreteOffer(offerId, request_);
+            writeJson(response, 200, {
+              psbt_base64: built.psbt_base64,
+              summary: {
+                input_outpoints: built.input_outpoints,
+                output_values: built.output_values,
+              },
+            });
+            return;
+          }
+        }
+
+        {
+          const signMatch = url.pathname.match(/^\/v1\/sat-for-sat\/offers\/([^/]+)\/sign$/);
+          if (method === "POST" && signMatch) {
+            const offerId = decodeURIComponent(signMatch[1] ?? "");
+            const body = (await readJsonBody(request)) as Record<string, unknown>;
+            const request_: SubmitOfferPsbtRequest = {
+              offer_psbt: ensureNonEmptyString(body.offer_psbt, "offer_psbt"),
+              offerer_signed_inputs: parseOptionalIntArray(
+                body.offerer_signed_inputs,
+                "offerer_signed_inputs",
+              ),
+              nonce: ensureNonEmptyString(body.nonce, "nonce"),
+            };
+            const offer = await offerService.submitConcreteOfferPsbt(offerId, request_);
+            writeJson(response, 200, { offer });
+            return;
+          }
+        }
+
+        {
+          const counterMatch = url.pathname.match(
+            /^\/v1\/sat-for-sat\/offers\/([^/]+)\/counter$/,
+          );
+          if (method === "POST" && counterMatch) {
+            const offerId = decodeURIComponent(counterMatch[1] ?? "");
+            const body = (await readJsonBody(request)) as Record<string, unknown>;
+            const request_: CounterOfferRequest = {
+              offer_psbt: ensureNonEmptyString(body.offer_psbt, "offer_psbt"),
+              offerer_signed_inputs: parseOptionalIntArray(
+                body.offerer_signed_inputs,
+                "offerer_signed_inputs",
+              ),
+              nonce: ensureNonEmptyString(body.nonce, "nonce"),
+              give_assets:
+                body.give_assets === undefined
+                  ? undefined
+                  : parseOfferAssetRefArray(body.give_assets, "give_assets"),
+              taker_assets:
+                body.taker_assets === undefined
+                  ? undefined
+                  : parseOfferAssetRefArray(body.taker_assets, "taker_assets"),
+              want_spec:
+                body.want_spec === undefined
+                  ? undefined
+                  : parseWantSpec(body.want_spec, "want_spec"),
+              expires_at:
+                body.expires_at === undefined
+                  ? undefined
+                  : body.expires_at === null
+                    ? null
+                    : ensureNonEmptyString(body.expires_at, "expires_at"),
+            };
+            const offer = await offerService.counterOffer(offerId, request_);
+            writeJson(response, 201, { offer });
+            return;
+          }
+        }
+
+        {
+          const cancelMatch = url.pathname.match(
+            /^\/v1\/sat-for-sat\/offers\/([^/]+)\/cancel$/,
+          );
+          if (method === "POST" && cancelMatch) {
+            const offerId = decodeURIComponent(cancelMatch[1] ?? "");
+            const body = (await readJsonBody(request)) as Record<string, unknown>;
+            const nonce = ensureNonEmptyString(body.nonce, "nonce");
+            const offer = offerService.cancelOffer(offerId, nonce);
+            writeJson(response, 200, { offer });
+            return;
+          }
+        }
+
+        {
+          const settledMatch = url.pathname.match(
+            /^\/v1\/sat-for-sat\/offers\/([^/]+)\/settled$/,
+          );
+          if (method === "POST" && settledMatch) {
+            const offerId = decodeURIComponent(settledMatch[1] ?? "");
+            const body = (await readJsonBody(request)) as Record<string, unknown>;
+            const txid = ensureNonEmptyString(body.txid, "txid");
+            const nonce = ensureNonEmptyString(body.nonce, "nonce");
+            const offer = offerService.settleOffer(offerId, txid, nonce);
+            writeJson(response, 200, { offer });
+            return;
+          }
+        }
+
         {
           const acceptMatch = url.pathname.match(
             /^\/v1\/sat-for-sat\/offers\/([^/]+)\/accept$/,
@@ -665,7 +972,12 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             const offerId = decodeURIComponent(acceptMatch[1] ?? "");
             const body = (await readJsonBody(request)) as Record<string, unknown>;
             const acceptPsbt = ensureNonEmptyString(body.accept_psbt, "accept_psbt");
-            const offer = await offerService.acceptOffer(offerId, acceptPsbt);
+            // nonce optional (legacy single-shot path passes none).
+            const nonce =
+              body.nonce === undefined || body.nonce === null
+                ? undefined
+                : ensureNonEmptyString(body.nonce, "nonce");
+            const offer = await offerService.acceptOffer(offerId, acceptPsbt, nonce);
             writeJson(response, 200, { offer });
             return;
           }
@@ -680,6 +992,22 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             }
 
             writeJson(response, 200, { offer });
+            return;
+          }
+        }
+
+        {
+          const threadMatch = url.pathname.match(
+            /^\/v1\/sat-for-sat\/negotiations\/([^/]+)$/,
+          );
+          if (method === "GET" && threadMatch) {
+            const negotiationId = decodeURIComponent(threadMatch[1] ?? "");
+            const rounds = offerService.getNegotiationThread(negotiationId);
+            if (rounds.length === 0) {
+              writeJson(response, 404, { error: "negotiation not found" });
+              return;
+            }
+            writeJson(response, 200, { negotiation_id: negotiationId, rounds });
             return;
           }
         }
