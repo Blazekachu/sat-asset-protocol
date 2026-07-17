@@ -450,7 +450,8 @@ test("backward-compat: legacy single-shot POST /v1/sat-for-sat/offers still retu
 
 // --- Partially-fillable BTC buy bids (WS-D, ADR-0019) ---------------------
 
-const BID_SELLER: TemplateInput = { outpoint: "5".repeat(64) + ":0", valueSats: 546, scriptPubkeyHex: p2wpkh("50") };
+const BID_SELLER_SPK = p2wpkh("50");
+const BID_SELLER_POSTAGE = 546;
 const BID_BUMP0: TemplateInput = { outpoint: "6".repeat(64) + ":0", valueSats: 600, scriptPubkeyHex: p2wpkh("60") };
 const BID_BUMP1: TemplateInput = { outpoint: "7".repeat(64) + ":0", valueSats: 600, scriptPubkeyHex: p2wpkh("70") };
 const BID_FEE: TemplateInput = { outpoint: "8".repeat(64) + ":0", valueSats: 10000, scriptPubkeyHex: p2wpkh("80") };
@@ -459,17 +460,40 @@ const BID_BUYER_ASSET_SPK = p2wpkh("ee");
 const BID_FEE_CHANGE_SPK = p2wpkh("ff");
 const BID_FEE_CHANGE_VALUE = 3000;
 
-function bidOrdOutputs(sellerSatStart: number): Record<string, OrdOutput> {
+// A deterministic distinct seller outpoint per delivered span/sat. Each fill
+// MUST reference its own UTXO whose ord sat_ranges exactly equals the claimed
+// span at offset 0 (BLOCKING 1: the asset is bound to the outpoint).
+function bidSellerOutpointFor(start: number, size: number): string {
+  return `${start.toString(16).padStart(8, "0")}${size.toString(16).padStart(8, "0")}`.padStart(64, "5") + ":0";
+}
+
+// An ord output for a seller UTXO holding exactly [start, start+size) at
+// offset 0, dust-sized postage.
+function bidSellerOrdOutput(outpoint: string, start: number, size: number): OrdOutput {
+  return {
+    ...makeOrdOutput(outpoint, start, BID_SELLER_POSTAGE),
+    sat_ranges: [[start, start + size]],
+    script_pubkey: BID_SELLER_SPK,
+  };
+}
+
+// Base ord outputs (2 bumps + fee funding), then register any seller UTXOs the
+// test builds fills against.
+function bidOrdOutputs(sellers: Array<{ start: number; size: number }> = []): Record<string, OrdOutput> {
   const withScript = (i: TemplateInput, satStart: number): OrdOutput => ({
     ...makeOrdOutput(i.outpoint, satStart, i.valueSats),
     script_pubkey: i.scriptPubkeyHex,
   });
-  return {
-    [BID_SELLER.outpoint]: withScript(BID_SELLER, sellerSatStart),
+  const outs: Record<string, OrdOutput> = {
     [BID_BUMP0.outpoint]: withScript(BID_BUMP0, 900000),
     [BID_BUMP1.outpoint]: withScript(BID_BUMP1, 900001),
     [BID_FEE.outpoint]: withScript(BID_FEE, 900002),
   };
+  for (const s of sellers) {
+    const op = bidSellerOutpointFor(s.start, s.size);
+    outs[op] = bidSellerOrdOutput(op, s.start, s.size);
+  }
+  return outs;
 }
 
 // A withServer variant whose ord client is sat-capable (for /candidates).
@@ -516,18 +540,19 @@ async function withBidServer(
   }
 }
 
-function buildBidFillPsbt(priceSats: number, sellerSig = 0x83): string {
+function buildBidFillPsbt(sellerOutpoint: string, priceSats: number, sellerSig = 0x83): string {
+  const seller: TemplateInput = { outpoint: sellerOutpoint, valueSats: BID_SELLER_POSTAGE, scriptPubkeyHex: BID_SELLER_SPK };
   return buildSatForSatPsbt(
     [
       { input: BID_BUMP0, sig: { sighash: 0x01 } },
       { input: BID_BUMP1, sig: { sighash: 0x01 } },
-      { input: BID_SELLER, sig: { sighash: sellerSig } },
+      { input: seller, sig: { sighash: sellerSig } },
       { input: BID_FEE, sig: { sighash: 0x01 } },
     ],
     [
       { valueSats: 1200, scriptPubkeyHex: BID_BUYER_BUMP_SPK },
-      { valueSats: BID_SELLER.valueSats, scriptPubkeyHex: BID_BUYER_ASSET_SPK },
-      { valueSats: priceSats, scriptPubkeyHex: BID_SELLER.scriptPubkeyHex },
+      { valueSats: BID_SELLER_POSTAGE, scriptPubkeyHex: BID_BUYER_ASSET_SPK },
+      { valueSats: priceSats, scriptPubkeyHex: BID_SELLER_SPK },
       { valueSats: BID_FEE_CHANGE_VALUE, scriptPubkeyHex: BID_FEE_CHANGE_SPK },
     ],
   );
@@ -540,10 +565,10 @@ interface BidBody {
   bid_remaining_quantity: number | null;
 }
 
-function bidBuildFillReq(fillAsset: unknown) {
+function bidBuildFillReq(fillAsset: { asset_outpoint: string }) {
   return {
     fill_asset: fillAsset,
-    seller_outpoint: BID_SELLER.outpoint,
+    seller_outpoint: fillAsset.asset_outpoint,
     seller_build: {
       bump_outpoints: [BID_BUMP0.outpoint, BID_BUMP1.outpoint],
       change_script_pubkey_hex: BID_BUYER_BUMP_SPK,
@@ -556,9 +581,10 @@ function bidBuildFillReq(fillAsset: unknown) {
   };
 }
 
+// A range fill asset bound to its dedicated per-span seller UTXO.
 const rangeFill = (start: number, size: number) => ({
   asset_type: "range" as const,
-  asset_outpoint: BID_SELLER.outpoint,
+  asset_outpoint: bidSellerOutpointFor(start, size),
   sat_number: start,
   sat_range_start: start,
   sat_range_size: size,
@@ -575,7 +601,7 @@ async function postBid(baseUrl: URL): Promise<BidBody> {
 }
 
 test("[BD1] POST /v1/bids creates an open bid (201) with remaining=target", async () => {
-  await withServer(bidOrdOutputs(500), async (baseUrl) => {
+  await withServer(bidOrdOutputs(), async (baseUrl) => {
     const bid = await postBid(baseUrl);
     assert.equal(bid.status, "open");
     assert.equal(bid.bid_remaining_quantity, 10);
@@ -589,11 +615,12 @@ test("[BD1] POST /v1/bids creates an open bid (201) with remaining=target", asyn
 });
 
 test("[BD2]/[BD3]/[BD4] build+submit partial fills, complete to filled, over-fill 400, cancel 200", async () => {
-  await withServer(bidOrdOutputs(500), async (baseUrl) => {
+  await withServer(bidOrdOutputs([{ start: 500, size: 6 }, { start: 506, size: 6 }, { start: 506, size: 4 }]), async (baseUrl) => {
     const bid = await postBid(baseUrl);
 
     // Build first fill k=6.
-    const buildRes = await postJson(baseUrl, `/v1/bids/${bid.offer_id}/fills/build`, bidBuildFillReq(rangeFill(500, 6)));
+    const fill1 = rangeFill(500, 6);
+    const buildRes = await postJson(baseUrl, `/v1/bids/${bid.offer_id}/fills/build`, bidBuildFillReq(fill1));
     assert.equal(buildRes.status, 200);
     const built = (await buildRes.json()) as { psbt_base64: string; fill_id: string; summary: { output_values: number[] } };
     assert.ok(built.psbt_base64.length > 0);
@@ -602,7 +629,7 @@ test("[BD2]/[BD3]/[BD4] build+submit partial fills, complete to filled, over-fil
     // Submit first fill (partial): remainder 10 -> 4, bid still open.
     const submitRes = await postJson(baseUrl, `/v1/bids/${bid.offer_id}/fills`, {
       fill_id: built.fill_id,
-      fill_psbt: buildBidFillPsbt(6000),
+      fill_psbt: buildBidFillPsbt(fill1.asset_outpoint, 6000),
       nonce: bid.nonce,
     });
     assert.equal(submitRes.status, 200);
@@ -615,10 +642,11 @@ test("[BD2]/[BD3]/[BD4] build+submit partial fills, complete to filled, over-fil
     assert.equal(overRes.status, 400);
 
     // Second fill k=4 -> filled.
-    const build2 = (await (await postJson(baseUrl, `/v1/bids/${bid.offer_id}/fills/build`, bidBuildFillReq(rangeFill(506, 4)))).json()) as { fill_id: string };
+    const fill2 = rangeFill(506, 4);
+    const build2 = (await (await postJson(baseUrl, `/v1/bids/${bid.offer_id}/fills/build`, bidBuildFillReq(fill2))).json()) as { fill_id: string };
     const submit2 = await postJson(baseUrl, `/v1/bids/${bid.offer_id}/fills`, {
       fill_id: build2.fill_id,
-      fill_psbt: buildBidFillPsbt(4000),
+      fill_psbt: buildBidFillPsbt(fill2.asset_outpoint, 4000),
       nonce: afterFirst.nonce,
     });
     assert.equal(submit2.status, 200);
@@ -628,8 +656,25 @@ test("[BD2]/[BD3]/[BD4] build+submit partial fills, complete to filled, over-fil
   });
 });
 
+test("[BD5] POST /v1/bids/:id/fills with a malformed fill_psbt returns 400 (not 500)", async () => {
+  await withServer(bidOrdOutputs([{ start: 500, size: 6 }]), async (baseUrl) => {
+    const bid = await postBid(baseUrl);
+    const fill = rangeFill(500, 6);
+    const build = (await (await postJson(baseUrl, `/v1/bids/${bid.offer_id}/fills/build`, bidBuildFillReq(fill))).json()) as { fill_id: string };
+
+    // Submitting a fill_psbt that is not valid base64/PSBT must be surfaced as a
+    // 400 user-input error, not a 500 (NON-BLOCKING 3).
+    const res = await postJson(baseUrl, `/v1/bids/${bid.offer_id}/fills`, {
+      fill_id: build.fill_id,
+      fill_psbt: "not-a-valid-psbt!!!",
+      nonce: bid.nonce,
+    });
+    assert.equal(res.status, 400);
+  });
+});
+
 test("[BD2] POST cancel cancels an open bid (200)", async () => {
-  await withServer(bidOrdOutputs(500), async (baseUrl) => {
+  await withServer(bidOrdOutputs(), async (baseUrl) => {
     const bid = await postBid(baseUrl);
     const res = await postJson(baseUrl, `/v1/bids/${bid.offer_id}/cancel`, { nonce: bid.nonce });
     assert.equal(res.status, 200);
@@ -639,7 +684,7 @@ test("[BD2] POST cancel cancels an open bid (200)", async () => {
 });
 
 test("[BD7] GET /v1/bids/:id/candidates returns holders; 400 when indexes off", async () => {
-  const ord = bidOrdOutputs(500);
+  const ord = bidOrdOutputs();
   await withBidServer(
     ord,
     { sat_index: true, address_index: true },

@@ -449,13 +449,7 @@ export function inputHasValidSignatureWithSighash(
  * for an ECDSA partial signature (`0x00` is NOT a valid ECDSA sighash flag).
  */
 function classifyPartialSig(value: Buffer): ParsedPsbtSignature {
-  // Smallest realistic DER ECDSA sig: 30 06 02 01 xx 02 01 xx = 8 bytes, plus
-  // the trailing sighash byte = 9 bytes total.
-  const looksLikeDer =
-    value.length >= 9 &&
-    value[0] === 0x30 &&
-    // DER content length byte matches the bytes between it and the sighash byte.
-    value[1] === value.length - 3;
+  const looksLikeDer = isMinimallyValidDerSig(value);
   const sighashType = value.length > 0 ? (value[value.length - 1] ?? null) : null;
   return {
     source: "partial_sig",
@@ -463,6 +457,57 @@ function classifyPartialSig(value: Buffer): ParsedPsbtSignature {
     sighashAllEquivalent: looksLikeDer && sighashType === 0x01,
     structurallyValid: looksLikeDer,
   };
+}
+
+/**
+ * Minimal DER validation for an ECDSA signature followed by a single sighash
+ * byte: `30 <seqLen> 02 <rLen> <r...> 02 <sLen> <s...> <sighash>`. We do not do
+ * full canonical-DER / low-S enforcement, but we DO require the structural
+ * shape so a length-matching junk value (e.g. `30 06 00 00 00 00 00 00 83`)
+ * cannot masquerade as a real signature: the SEQUENCE tag/length, both INTEGER
+ * tags with strictly-positive lengths, and the two components must consume the
+ * sequence body EXACTLY, ending right before the trailing sighash byte.
+ */
+function isMinimallyValidDerSig(value: Buffer): boolean {
+  // Smallest realistic DER ECDSA sig: 30 06 02 01 xx 02 01 xx = 8 bytes, plus
+  // the trailing sighash byte = 9 bytes total.
+  if (value.length < 9) {
+    return false;
+  }
+  if (value[0] !== 0x30) {
+    return false;
+  }
+  const seqLen = value[1] ?? -1;
+  // The sequence body is everything between the length byte and the trailing
+  // sighash byte, so seqLen must equal value.length - 3.
+  if (seqLen !== value.length - 3) {
+    return false;
+  }
+
+  // r INTEGER: 02 <rLen> <rLen bytes>.
+  let offset = 2;
+  if (value[offset] !== 0x02) {
+    return false;
+  }
+  const rLen = value[offset + 1] ?? -1;
+  if (rLen <= 0) {
+    return false;
+  }
+  offset += 2 + rLen;
+
+  // s INTEGER: 02 <sLen> <sLen bytes>.
+  if (value[offset] !== 0x02) {
+    return false;
+  }
+  const sLen = value[offset + 1] ?? -1;
+  if (sLen <= 0) {
+    return false;
+  }
+  offset += 2 + sLen;
+
+  // The two INTEGER components must consume the sequence body exactly, leaving
+  // only the single trailing sighash byte.
+  return offset === value.length - 1;
 }
 
 /**

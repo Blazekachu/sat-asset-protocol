@@ -51,8 +51,9 @@ import {
   normalizeWantSpec,
   assetsSatisfyWant,
 } from "./offer-predicates.ts";
-import { buildBuyerFillTemplatePsbt, validateBidFillPsbt } from "./psbt.ts";
+import { buildBuyerFillTemplatePsbt, PsbtValidationError, validateBidFillPsbt } from "./psbt.ts";
 import type { DustPolicy, TemplateInput } from "./psbt.ts";
+import { DustValidationError } from "./dust.ts";
 import type { OrdSat, OrdStatus } from "./types.ts";
 import {
   buildSatForSatBundlePsbt,
@@ -72,6 +73,31 @@ import {
  * from ListingValidationError which maps to 400).
  */
 export class OfferNotFoundError extends Error {}
+
+/**
+ * Run a PSBT/script build-or-validate callback and translate the plain `Error`s
+ * that `psbt.ts`/`dust.ts` throw for malformed user input (invalid PSBT magic,
+ * missing unsigned tx, invalid script hex, unknown script type, etc.) into a
+ * `PsbtValidationError` so the server maps them to HTTP 400 instead of 500.
+ * Errors already typed as client errors are rethrown unchanged.
+ */
+function mapPsbtUserInputError<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (error) {
+    if (
+      error instanceof ListingValidationError ||
+      error instanceof PsbtValidationError ||
+      error instanceof DustValidationError
+    ) {
+      throw error;
+    }
+    if (error instanceof Error) {
+      throw new PsbtValidationError(error.message);
+    }
+    throw error;
+  }
+}
 
 export interface OfferServiceDependencies {
   store: ListingStore;
@@ -780,13 +806,28 @@ export class OfferService {
     const totalBtcSats = bid.bid_total_btc_sats ?? 0;
     const unitPrice = Math.floor(totalBtcSats / targetQuantity);
 
-    const sellerAsset = normalizeAssetRef(input.fill_asset, "fill_asset");
     const sellerOutpoint = ensureRequiredString(input.seller_outpoint, "seller_outpoint");
     const buyerAssetScriptPubkeyHex = ensureRequiredString(
       input.buyer_asset_script_pubkey_hex,
       "buyer_asset_script_pubkey_hex",
     );
     const sellerBuild = this.#normalizeSideBuild(input.seller_build, "seller_build");
+
+    // Bind the declared fill asset to the seller outpoint server-side. If the
+    // caller supplied an asset_outpoint, it must equal seller_outpoint — never
+    // let a filler claim one asset while delivering a DIFFERENT UTXO. Then
+    // resolve the asset against ord (offset-0 + whole-range checks) so the
+    // delivered UTXO actually contains the claimed sat/range.
+    const declaredAsset = normalizeAssetRef(input.fill_asset, "fill_asset");
+    if (
+      declaredAsset.asset_outpoint !== null &&
+      declaredAsset.asset_outpoint !== sellerOutpoint
+    ) {
+      throw new ListingValidationError(
+        "fill_asset.asset_outpoint must equal seller_outpoint",
+      );
+    }
+    const sellerAsset: OfferAssetRef = { ...declaredAsset, asset_outpoint: sellerOutpoint };
 
     // Overlap re-check against active (reserved/settled) ledger rows.
     const alreadyFilled = this.#store
@@ -803,9 +844,11 @@ export class OfferService {
       );
     }
 
-    // Seller UTXO on-chain VALUE (postage), independent of k.
-    const sellerOrdOutput = await fetchIndexedUnspentOutput(this.#ordClient, sellerOutpoint);
-    const sellerUtxoValueSats = sellerOrdOutput.value;
+    // Resolve the asset against ord's sat_ranges: asserts the claimed sat/range
+    // is at offset 0 in seller_outpoint and (for ranges) equals the whole-UTXO
+    // span. This binds the debited quantity/overlap to the actual UTXO contents.
+    const sellerAssetInput = await this.#resolveAssetInput(sellerAsset);
+    const sellerUtxoValueSats = sellerAssetInput.valueSats;
     const listingPriceSats = k * unitPrice;
 
     // Resolve the two bidder bumps + fee funding.
@@ -830,20 +873,22 @@ export class OfferService {
 
     // Reuse the canonical 2-bump fill builder with role mapping:
     // filler = "seller" (input 2 = their sat UTXO), bidder = "buyer".
-    const template = buildBuyerFillTemplatePsbt(
-      {
-        sellerOutpoint,
-        sellerInputValueSats: sellerUtxoValueSats,
-        sellerInputScriptPubkeyHex: sellerOrdOutput.script_pubkey,
-        listingPriceSats,
-        bumpInputs,
-        fundingInputs: [feeFundingInput],
-        buyerBumpScriptPubkeyHex: sellerBuild.change_script_pubkey_hex,
-        buyerAssetScriptPubkeyHex,
-        buyerChangeScriptPubkeyHex: feePayerChangeScriptPubkeyHex,
-        buyerChangeValueSats: feePayerChangeValueSats,
-      },
-      dustPolicy ?? {},
+    const template = mapPsbtUserInputError(() =>
+      buildBuyerFillTemplatePsbt(
+        {
+          sellerOutpoint,
+          sellerInputValueSats: sellerUtxoValueSats,
+          sellerInputScriptPubkeyHex: sellerAssetInput.scriptPubkeyHex,
+          listingPriceSats,
+          bumpInputs,
+          fundingInputs: [feeFundingInput],
+          buyerBumpScriptPubkeyHex: sellerBuild.change_script_pubkey_hex,
+          buyerAssetScriptPubkeyHex,
+          buyerChangeScriptPubkeyHex: feePayerChangeScriptPubkeyHex,
+          buyerChangeValueSats: feePayerChangeValueSats,
+        },
+        dustPolicy ?? {},
+      ),
     );
 
     const fillId = this.#createOfferId();
@@ -901,14 +946,17 @@ export class OfferService {
       throw new ListingValidationError(`fill is not pending build (state=${pending.state})`);
     }
 
-    // Validate the co-signed PSBT against SERVER-persisted values.
-    validateBidFillPsbt(
-      fillPsbt,
-      ensureRequiredString(pending.seller_outpoint, "seller_outpoint"),
-      pending.price_sats ?? 0,
-      ensureRequiredString(pending.buyer_asset_script_pubkey_hex, "buyer_asset_script_pubkey_hex"),
-      pending.seller_utxo_value_sats ?? 0,
-      this.#dustPolicy,
+    // Validate the co-signed PSBT against SERVER-persisted values. Wrap so a
+    // malformed base64/PSBT (plain Error) maps to a 400, not a 500.
+    mapPsbtUserInputError(() =>
+      validateBidFillPsbt(
+        fillPsbt,
+        ensureRequiredString(pending.seller_outpoint, "seller_outpoint"),
+        pending.price_sats ?? 0,
+        ensureRequiredString(pending.buyer_asset_script_pubkey_hex, "buyer_asset_script_pubkey_hex"),
+        pending.seller_utxo_value_sats ?? 0,
+        this.#dustPolicy,
+      ),
     );
 
     const filledAssetRef = this.#bidFillAssetRef(pending);

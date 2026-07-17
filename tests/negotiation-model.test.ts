@@ -15,7 +15,9 @@ import {
   buildUnsignedTransaction,
   encodeMapEntry,
   encodeWitnessUtxoMap,
+  PsbtValidationError,
   PSBT_MAGIC,
+  validateBidFillPsbt,
 } from "../src/psbt.ts";
 import type { OfferAssetRef, WantSpec } from "../src/listing-types.ts";
 import type { ListingOrdClient } from "../src/listing-service.ts";
@@ -394,26 +396,48 @@ test("expireOffer + lazy expiry reports a past-expiry open round as expired", as
 
 // --- Partially-fillable BTC buy bids (WS-D, ADR-0019) ---------------------
 
-const BID_SELLER_OP = "5".repeat(64) + ":0";
 const BID_BUMP0_OP = "6".repeat(64) + ":0";
 const BID_BUMP1_OP = "7".repeat(64) + ":0";
 const BID_FEE_OP = "8".repeat(64) + ":0";
 
-const SELLER_SPK = p2wpkh("aa"); // makeOrdOutput default script for the seller UTXO
+const SELLER_SPK = p2wpkh("aa");
 const BUYER_BUMP_SPK = p2wpkh("cc");
 const BUYER_ASSET_SPK = p2wpkh("ee");
 const FEE_CHANGE_SPK2 = p2wpkh("ff");
 const FEE_CHANGE_VALUE2 = 3000;
 const SELLER_POSTAGE = 546;
 
-// Ord outputs needed to build any bid fill (seller UTXO + 2 bumps + fee funding).
-function bidFillOrdOutputs(sellerSatStart: number): Record<string, OrdOutput> {
+// A deterministic distinct seller outpoint per delivered span/sat. Each fill
+// MUST reference its own UTXO whose ord sat_ranges exactly equals the claimed
+// span at offset 0 (BLOCKING 1: the asset is bound to the outpoint).
+function sellerOutpointFor(start: number, size: number): string {
+  return `${start.toString(16).padStart(8, "0")}${size.toString(16).padStart(8, "0")}`.padStart(64, "5") + ":0";
+}
+
+// An ord output for a seller UTXO holding exactly [start, start+size) at
+// offset 0, dust-sized postage.
+function sellerOrdOutput(outpoint: string, start: number, size: number): OrdOutput {
   return {
-    [BID_SELLER_OP]: makeOrdOutput(BID_SELLER_OP, sellerSatStart),
+    ...makeOrdOutput(outpoint, start),
+    sat_ranges: [[start, start + size]],
+    value: SELLER_POSTAGE,
+    script_pubkey: SELLER_SPK,
+  };
+}
+
+// Base ord outputs (2 bumps + fee funding), then register any seller UTXOs the
+// test builds fills against.
+function bidFillOrdOutputs(sellers: Array<{ start: number; size: number }> = []): Record<string, OrdOutput> {
+  const outs: Record<string, OrdOutput> = {
     [BID_BUMP0_OP]: { ...makeOrdOutput(BID_BUMP0_OP, 900000), value: 600, script_pubkey: p2wpkh("b0") },
     [BID_BUMP1_OP]: { ...makeOrdOutput(BID_BUMP1_OP, 900001), value: 600, script_pubkey: p2wpkh("b1") },
     [BID_FEE_OP]: { ...makeOrdOutput(BID_FEE_OP, 900002), value: 10000, script_pubkey: p2wpkh("fe") },
   };
+  for (const s of sellers) {
+    const op = sellerOutpointFor(s.start, s.size);
+    outs[op] = sellerOrdOutput(op, s.start, s.size);
+  }
+  return outs;
 }
 
 const bidSellerBuild = () => ({
@@ -422,10 +446,29 @@ const bidSellerBuild = () => ({
   ordinals_script_pubkey_hex: p2wpkh("dd"),
 });
 
-function buildFillRequest(fillAsset: OfferAssetRef) {
+// Build a fill request delivering [start,start+size) (size 1 = single sat) from
+// its dedicated seller UTXO. `asAsset` overrides the declared fill_asset (used
+// to test the outpoint-binding attack).
+function buildFillRequest(
+  start: number,
+  size: number,
+  overrides: { fill_asset?: OfferAssetRef; seller_outpoint?: string } = {},
+) {
+  const sellerOutpoint = overrides.seller_outpoint ?? sellerOutpointFor(start, size);
+  const fillAsset: OfferAssetRef =
+    overrides.fill_asset ??
+    (size === 1
+      ? { asset_type: "sat", asset_outpoint: sellerOutpoint, sat_number: start }
+      : {
+          asset_type: "range",
+          asset_outpoint: sellerOutpoint,
+          sat_number: start,
+          sat_range_start: start,
+          sat_range_size: size,
+        });
   return {
     fill_asset: fillAsset,
-    seller_outpoint: BID_SELLER_OP,
+    seller_outpoint: sellerOutpoint,
     seller_build: bidSellerBuild(),
     buyer_asset_script_pubkey_hex: BUYER_ASSET_SPK,
     fee_funding_outpoint: BID_FEE_OP,
@@ -437,12 +480,20 @@ function buildFillRequest(fillAsset: OfferAssetRef) {
 // Compose a CO-SIGNED bid-fill PSBT matching buildBuyerFillTemplatePsbt's layout:
 //   inputs:  bump0(SIGHASH_ALL), bump1(ALL), seller(SINGLE|ANYONECANPAY), fee(ALL)
 //   outputs: [1200 -> buyerBump, postage -> buyerAsset, price -> seller, feeChange]
-function buildCoSignedFillPsbt(listingPriceSats: number, sellerSig = 0x83): string {
+function buildCoSignedFillPsbt(
+  sellerOutpoint: string,
+  listingPriceSats: number,
+  sellerSig = 0x83,
+  // Optional raw hex to inject as the seller input's partial-sig VALUE (instead
+  // of the canonical DER prefix + sighash). Used to test that a malformed
+  // (length-matching but non-DER) value is rejected by validateBidFillPsbt.
+  sellerSigValueHex?: string,
+): string {
   const inputs = [
-    { outpoint: BID_BUMP0_OP, valueSats: 600, scriptPubkeyHex: p2wpkh("b0"), sighash: 0x01 },
-    { outpoint: BID_BUMP1_OP, valueSats: 600, scriptPubkeyHex: p2wpkh("b1"), sighash: 0x01 },
-    { outpoint: BID_SELLER_OP, valueSats: SELLER_POSTAGE, scriptPubkeyHex: SELLER_SPK, sighash: sellerSig },
-    { outpoint: BID_FEE_OP, valueSats: 10000, scriptPubkeyHex: p2wpkh("fe"), sighash: 0x01 },
+    { outpoint: BID_BUMP0_OP, valueSats: 600, scriptPubkeyHex: p2wpkh("b0"), sighash: 0x01, sigValueHex: undefined as string | undefined },
+    { outpoint: BID_BUMP1_OP, valueSats: 600, scriptPubkeyHex: p2wpkh("b1"), sighash: 0x01, sigValueHex: undefined as string | undefined },
+    { outpoint: sellerOutpoint, valueSats: SELLER_POSTAGE, scriptPubkeyHex: SELLER_SPK, sighash: sellerSig, sigValueHex: sellerSigValueHex },
+    { outpoint: BID_FEE_OP, valueSats: 10000, scriptPubkeyHex: p2wpkh("fe"), sighash: 0x01, sigValueHex: undefined as string | undefined },
   ];
   const outputs = [
     { valueSats: 1200, scriptPubkeyHex: BUYER_BUMP_SPK },
@@ -462,7 +513,9 @@ function buildCoSignedFillPsbt(listingPriceSats: number, sellerSig = 0x83): stri
     const entries: Buffer[] = [encodeWitnessUtxoMap(spec.valueSats, spec.scriptPubkeyHex)];
     const pubkey = Buffer.from("02".repeat(33), "hex");
     const key = Buffer.concat([Buffer.from([0x02]), pubkey]);
-    const value = Buffer.concat([Buffer.from("3006020101020101", "hex"), Buffer.from([spec.sighash])]);
+    const value = spec.sigValueHex
+      ? Buffer.from(spec.sigValueHex, "hex")
+      : Buffer.concat([Buffer.from("3006020101020101", "hex"), Buffer.from([spec.sighash])]);
     entries.push(encodeMapEntry(key, value));
     return Buffer.concat([...entries, Buffer.from([0x00])]);
   });
@@ -495,14 +548,15 @@ test("[BD1] postBid derives unit price (floor(T/N)) + persists open remainder", 
 });
 
 test("[BD2] buildBidFill partial k<N: output 2 = k*unit_price, output 1 = seller postage; submit debits remainder by logical k, rotates nonce, bid stays open", async () => {
-  const { service } = makeService(bidFillOrdOutputs(500));
+  const { service } = makeService(bidFillOrdOutputs([{ start: 500, size: 4 }]));
   const bid = await service.postBid({
     want_spec: { mode: "specific", assets: [range(500, 10)] },
     bid_target_quantity: 10,
     bid_total_btc_sats: 10000, // unit_price = 1000
   });
 
-  const built = await service.buildBidFill(bid.offer_id, buildFillRequest(range(500, 4)));
+  const req = buildFillRequest(500, 4);
+  const built = await service.buildBidFill(bid.offer_id, req);
   assert.ok(built.psbt_base64.length > 0);
   assert.ok(built.fill_id);
   // output 2 pays k*unit_price = 4000; output 1 carries the postage value (546).
@@ -512,7 +566,7 @@ test("[BD2] buildBidFill partial k<N: output 2 = k*unit_price, output 1 = seller
   const before = service.getBid(bid.offer_id)!;
   const updated = await service.submitBidFill(bid.offer_id, {
     fill_id: built.fill_id,
-    fill_psbt: buildCoSignedFillPsbt(4000),
+    fill_psbt: buildCoSignedFillPsbt(req.seller_outpoint, 4000),
     nonce: before.nonce,
   });
   assert.equal(updated.status, "open");
@@ -521,30 +575,29 @@ test("[BD2] buildBidFill partial k<N: output 2 = k*unit_price, output 1 = seller
 });
 
 test("[BD2] single-sat fill debits by exactly 1 even though output 1 carries postage sats", async () => {
-  const { service } = makeService(bidFillOrdOutputs(777));
+  const { service } = makeService(bidFillOrdOutputs([{ start: 777, size: 1 }]));
   const bid = await service.postBid({
-    want_spec: { mode: "specific", assets: [sat(777, BID_SELLER_OP)] },
+    want_spec: { mode: "specific", assets: [sat(777, sellerOutpointFor(777, 1)) as OfferAssetRef] },
     bid_target_quantity: 3,
     bid_total_btc_sats: 3000, // unit_price = 1000
   });
-  const built = await service.buildBidFill(
-    bid.offer_id,
-    buildFillRequest({ asset_type: "sat", asset_outpoint: BID_SELLER_OP, sat_number: 777 }),
-  );
+  const req = buildFillRequest(777, 1);
+  const built = await service.buildBidFill(bid.offer_id, req);
   assert.equal(built.output_values[2], 1000); // k=1 -> unit_price
   assert.equal(built.output_values[1], SELLER_POSTAGE);
   const before = service.getBid(bid.offer_id)!;
   const updated = await service.submitBidFill(bid.offer_id, {
     fill_id: built.fill_id,
-    fill_psbt: buildCoSignedFillPsbt(1000),
+    fill_psbt: buildCoSignedFillPsbt(req.seller_outpoint, 1000),
     nonce: before.nonce,
   });
   assert.equal(updated.bid_remaining_quantity, 2); // debited by 1, not by 546
 });
 
 test("[BD3] fills summing to N transition the bid to filled", async () => {
-  const outs = bidFillOrdOutputs(500);
-  const { service } = makeService(outs);
+  const { service } = makeService(
+    bidFillOrdOutputs([{ start: 500, size: 6 }, { start: 506, size: 4 }]),
+  );
   const bid = await service.postBid({
     want_spec: { mode: "specific", assets: [range(500, 10)] },
     bid_target_quantity: 10,
@@ -552,20 +605,22 @@ test("[BD3] fills summing to N transition the bid to filled", async () => {
   });
 
   // Fill 1: [500,506) k=6.
-  const b1 = await service.buildBidFill(bid.offer_id, buildFillRequest(range(500, 6)));
+  const r1 = buildFillRequest(500, 6);
+  const b1 = await service.buildBidFill(bid.offer_id, r1);
   let cur = service.getBid(bid.offer_id)!;
-  await service.submitBidFill(bid.offer_id, { fill_id: b1.fill_id, fill_psbt: buildCoSignedFillPsbt(6000), nonce: cur.nonce });
+  await service.submitBidFill(bid.offer_id, { fill_id: b1.fill_id, fill_psbt: buildCoSignedFillPsbt(r1.seller_outpoint, 6000), nonce: cur.nonce });
 
   // Fill 2: [506,510) k=4 -> remainder hits 0 -> filled.
-  const b2 = await service.buildBidFill(bid.offer_id, buildFillRequest(range(506, 4)));
+  const r2 = buildFillRequest(506, 4);
+  const b2 = await service.buildBidFill(bid.offer_id, r2);
   cur = service.getBid(bid.offer_id)!;
-  const done = await service.submitBidFill(bid.offer_id, { fill_id: b2.fill_id, fill_psbt: buildCoSignedFillPsbt(4000), nonce: cur.nonce });
+  const done = await service.submitBidFill(bid.offer_id, { fill_id: b2.fill_id, fill_psbt: buildCoSignedFillPsbt(r2.seller_outpoint, 4000), nonce: cur.nonce });
   assert.equal(done.status, "filled");
   assert.equal(done.bid_remaining_quantity, 0);
 });
 
 test("[BD4] over-fill (k > remaining) is rejected at build time", async () => {
-  const { service } = makeService(bidFillOrdOutputs(500));
+  const { service } = makeService(bidFillOrdOutputs([{ start: 500, size: 20 }]));
   const bid = await service.postBid({
     want_spec: { mode: "specific", assets: [range(500, 10)] },
     bid_target_quantity: 10,
@@ -573,13 +628,13 @@ test("[BD4] over-fill (k > remaining) is rejected at build time", async () => {
   });
   // want range is only size 10; a size-20 delivered range exceeds remaining.
   await assert.rejects(
-    service.buildBidFill(bid.offer_id, buildFillRequest(range(500, 20))),
+    service.buildBidFill(bid.offer_id, buildFillRequest(500, 20)),
     ListingValidationError,
   );
 });
 
 test("[BD6] fill failing the want (out-of-range / predicate) is rejected", async () => {
-  const { service } = makeService(bidFillOrdOutputs(2000));
+  const { service } = makeService(bidFillOrdOutputs([{ start: 2000, size: 4 }]));
   const bid = await service.postBid({
     want_spec: { mode: "specific", assets: [range(500, 10)] },
     bid_target_quantity: 10,
@@ -587,27 +642,109 @@ test("[BD6] fill failing the want (out-of-range / predicate) is rejected", async
   });
   // Delivered range [2000,2004) is not contained in wanted [500,510).
   await assert.rejects(
-    service.buildBidFill(bid.offer_id, buildFillRequest(range(2000, 4))),
+    service.buildBidFill(bid.offer_id, buildFillRequest(2000, 4)),
     ListingValidationError,
   );
 });
 
 test("[BD8] strict subrange fully contained debits by delivered size; overlapping second fill rejected", async () => {
-  const { service } = makeService(bidFillOrdOutputs(500));
+  const { service } = makeService(
+    bidFillOrdOutputs([{ start: 502, size: 3 }, { start: 503, size: 2 }]),
+  );
   const bid = await service.postBid({
     want_spec: { mode: "specific", assets: [range(500, 10)] },
     bid_target_quantity: 10,
     bid_total_btc_sats: 10000,
   });
-  const b1 = await service.buildBidFill(bid.offer_id, buildFillRequest(range(502, 3)));
-  let cur = service.getBid(bid.offer_id)!;
-  const after1 = await service.submitBidFill(bid.offer_id, { fill_id: b1.fill_id, fill_psbt: buildCoSignedFillPsbt(3000), nonce: cur.nonce });
+  const r1 = buildFillRequest(502, 3);
+  const b1 = await service.buildBidFill(bid.offer_id, r1);
+  const cur = service.getBid(bid.offer_id)!;
+  const after1 = await service.submitBidFill(bid.offer_id, { fill_id: b1.fill_id, fill_psbt: buildCoSignedFillPsbt(r1.seller_outpoint, 3000), nonce: cur.nonce });
   assert.equal(after1.bid_remaining_quantity, 7); // debited by delivered size 3, not wanted size 10
 
   // A second fill overlapping [502,505) is rejected by the want matcher.
   await assert.rejects(
-    service.buildBidFill(bid.offer_id, buildFillRequest(range(503, 2))),
+    service.buildBidFill(bid.offer_id, buildFillRequest(503, 2)),
     ListingValidationError,
+  );
+});
+
+test("[BD10] buildBidFill rejects a fill claiming one range while supplying a different seller UTXO (asset-outpoint binding)", async () => {
+  // Register the honest seller UTXO for [500,504) AND a decoy UTXO holding an
+  // unrelated range. The attacker declares fill_asset={range 500..504} (to
+  // satisfy the want matcher) but supplies the decoy outpoint as seller_outpoint.
+  const decoyOutpoint = "d".repeat(64) + ":0";
+  const ordOutputs = bidFillOrdOutputs([{ start: 500, size: 4 }]);
+  ordOutputs[decoyOutpoint] = sellerOrdOutput(decoyOutpoint, 9000, 4); // holds [9000,9004)
+  const { service } = makeService(ordOutputs);
+  const bid = await service.postBid({
+    want_spec: { mode: "specific", assets: [range(500, 10)] },
+    bid_target_quantity: 10,
+    bid_total_btc_sats: 10000,
+  });
+
+  // (a) asset_outpoint disagrees with seller_outpoint -> rejected up-front.
+  await assert.rejects(
+    service.buildBidFill(
+      bid.offer_id,
+      buildFillRequest(500, 4, {
+        seller_outpoint: decoyOutpoint,
+        fill_asset: {
+          asset_type: "range",
+          asset_outpoint: sellerOutpointFor(500, 4),
+          sat_number: 500,
+          sat_range_start: 500,
+          sat_range_size: 4,
+        },
+      }),
+    ),
+    ListingValidationError,
+  );
+
+  // (b) even if the attacker omits/aligns asset_outpoint to the decoy, the
+  // decoy's ord sat_ranges ([9000,9004)) do not contain the claimed range, so
+  // #resolveAssetInput's offset-0/whole-range check rejects it.
+  await assert.rejects(
+    service.buildBidFill(
+      bid.offer_id,
+      buildFillRequest(500, 4, {
+        seller_outpoint: decoyOutpoint,
+        fill_asset: {
+          asset_type: "range",
+          asset_outpoint: decoyOutpoint,
+          sat_number: 500,
+          sat_range_start: 500,
+          sat_range_size: 4,
+        },
+      }),
+    ),
+    ListingValidationError,
+  );
+});
+
+test("[BD5] validateBidFillPsbt rejects a seller input carrying a malformed, length-matching non-DER partial signature", () => {
+  const sellerOutpoint = sellerOutpointFor(500, 4);
+  // `30 06 00 00 00 00 00 00 83` — a 0x30 SEQUENCE tag with a matching length
+  // byte and a trailing 0x83 (SIGHASH_SINGLE|ANYONECANPAY) suffix, but the body
+  // has no valid DER INTEGER (r,s) components. This must NOT pass structural
+  // validation (BLOCKING 2).
+  const malformed = buildCoSignedFillPsbt(sellerOutpoint, 4000, 0x83, "300600000000000083");
+  assert.throws(
+    () =>
+      validateBidFillPsbt(
+        malformed,
+        sellerOutpoint,
+        4000,
+        BUYER_ASSET_SPK,
+        SELLER_POSTAGE,
+      ),
+    PsbtValidationError,
+  );
+
+  // Sanity: the canonical (valid-DER) seller signature is still accepted.
+  const valid = buildCoSignedFillPsbt(sellerOutpoint, 4000, 0x83);
+  assert.doesNotThrow(() =>
+    validateBidFillPsbt(valid, sellerOutpoint, 4000, BUYER_ASSET_SPK, SELLER_POSTAGE),
   );
 });
 
