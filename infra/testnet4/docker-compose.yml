@@ -4,8 +4,8 @@
 #   docker compose up -d --build
 #   curl -sS http://127.0.0.1:8080/status
 #
-# Protocol:
-#   ORD_BASE_URL=http://127.0.0.1:8080
+# Point the reference implementation at this node:
+#   SAT_ASSET_ORD_BASE_URL=http://127.0.0.1:8080
 
 services:
   bitcoind:
