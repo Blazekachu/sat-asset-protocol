@@ -41,7 +41,7 @@ Bitcoin meta-protocols often drift into reimplementing lower layers. BRC-20 init
 
 ## Compliance
 
-- README and AGENTS.md state non-replacement explicitly.
+- README states non-replacement explicitly.
 - No inscription encoding or indexing code in protocol repo.
 
 ## References

@@ -12,8 +12,7 @@
 Phase 2 Session 07 is only scaffolding the reference implementation: configuration, a read-only ord
 HTTP client, and a live testnet4 integration test for `GET /status`.
 
-The open stack question in [AGENT_LINEUP.md](../../AGENT_LINEUP.md) is whether to start the
-reference implementation in Rust or TypeScript.
+The open stack question is whether to start the reference implementation in Rust or TypeScript.
 
 Both are viable long-term:
 
@@ -89,5 +88,4 @@ deployment target, that change requires a new ADR superseding or refining this o
 ## References
 
 - [ROADMAP.md](../../ROADMAP.md)
-- [AGENT_LINEUP.md](../../AGENT_LINEUP.md)
 - [docs/PROTOCOL_SPEC_v1.md](../PROTOCOL_SPEC_v1.md)

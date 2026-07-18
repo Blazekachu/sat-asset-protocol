@@ -2,7 +2,7 @@
 
 ## Before You Code
 
-1. Read [AGENTS.md](./AGENTS.md) and [docs/README.md](./docs/README.md).
+1. Read [docs/README.md](./docs/README.md) for the research index and context.
 2. Read accepted [ADRs](./docs/adr/README.md) — they are binding for implementation.
 3. Do not write production code until the phase you're working on is defined in [ROADMAP.md](./ROADMAP.md).
 
@@ -57,7 +57,6 @@ Every **major design choice** needs an ADR **before** implementation merges.
 
 ```
 sat-asset-protocol/
-├── AGENTS.md           # Agent entry point
 ├── README.md
 ├── ROADMAP.md
 ├── CONTRIBUTING.md
