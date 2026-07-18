@@ -47,6 +47,10 @@ Do **not** write ADRs for trivial choices (formatter, folder naming, single-line
 | [0013](./0013-attestation-signature-scheme-ed25519.md) | Attestation signature scheme (Ed25519) | Accepted |
 | [0014](./0014-sat-for-sat-offer-accept-sighash-all.md) | Sat-for-sat via offer/accept (SIGHASH_ALL) | Accepted |
 | [0015](./0015-dust-and-canonical-postage.md) | Per-script-type dust thresholds + canonical postage | Accepted |
+| [0016](./0016-open-intent-point-to-point-settlement.md) | Open intent advertisement + point-to-point settlement | Accepted |
+| [0017](./0017-counter-offers-negotiation-thread.md) | Counter-offers as new objects in a negotiation thread | Accepted |
+| [0018](./0018-bundle-and-range-barter.md) | Bundle (M×N) and range barter | Accepted |
+| [0019](./0019-partial-fill-btc-buy-bids.md) | Partially-fillable BTC buy bids | Accepted |
 
 ---
 

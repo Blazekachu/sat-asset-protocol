@@ -88,6 +88,19 @@
 
 ---
 
+## Phase 5 — v3 Complete Offer Matrix (In Progress)
+
+Backend-only. Completes the sat-for-sat / sat-for-BTC offer matrix on top of the ADR-0014
+point-to-point settlement, adding discoverable advertisements, negotiation, bundles/ranges, and
+BTC-denominated partial-fill bids. Each major choice is fixed by an ADR before its code merges.
+
+- [ ] Open intent advertisement + point-to-point settlement — [ADR-0016 (Accepted)](docs/adr/0016-open-intent-point-to-point-settlement.md): two-phase model (open discoverable intent → concrete `SIGHASH_ALL` settlement round) reconciling ADR-0014 with postable specific-sat/range wants
+- [ ] Counter-offers as new objects in a negotiation thread — [ADR-0017 (Accepted)](docs/adr/0017-counter-offers-negotiation-thread.md): append-only rounds (`parent_offer_id`/`supersedes`/`counter_index`), per-round expiry + nonce, end-to-end re-validation; invalidation race surfaced, not prevented
+- [ ] Bundle (M×N) and range barter — [ADR-0018 (Accepted)](docs/adr/0018-bundle-and-range-barter.md): generalize the canonical 2-bump template to M×N asset legs (one bump per asset), range as a single contiguous whole-UTXO asset; reduces to ADR-0014 at M=N=1
+- [ ] Partially-fillable BTC buy bids — [ADR-0019 (Accepted)](docs/adr/0019-partial-fill-btc-buy-bids.md): fungible-BTC bids filled by multiple sellers, co-signed per-fill point-to-point settlements (Decision #2045), `floor(T/N)` unit price + reserved-quantity ledger (Decision #2046)
+
+---
+
 ## Explicit Non-Goals
 
 - Replacing ord or Ordinals

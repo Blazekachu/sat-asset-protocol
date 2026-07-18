@@ -86,7 +86,7 @@ const P2WPKH = (fill: string) => "0014" + fill.repeat(20);
 const SELLER_OUTPOINT = "1".repeat(64) + ":0";
 const PRICE_SATS = 1000;
 
-test("validateCanonicalTwoBumpFillPsbt accepts the canonical 1200-sat passthrough with dust-safe outputs", () => {
+test("[M2][D1] validateCanonicalTwoBumpFillPsbt accepts the canonical 1200-sat passthrough with dust-safe outputs", () => {
   const psbt = buildFillPsbt(SELLER_OUTPOINT, [
     { valueSats: 1200, scriptPubkeyHex: P2WPKH("66") },
     { valueSats: 4000, scriptPubkeyHex: P2WPKH("77") },
@@ -99,7 +99,7 @@ test("validateCanonicalTwoBumpFillPsbt accepts the canonical 1200-sat passthroug
   assert.equal(result.buyerInputCount, 3);
 });
 
-test("validateCanonicalTwoBumpFillPsbt throws DustValidationError for a sub-dust output", () => {
+test("[D2] validateCanonicalTwoBumpFillPsbt throws DustValidationError for a sub-dust output", () => {
   const psbt = buildFillPsbt(SELLER_OUTPOINT, [
     { valueSats: 1200, scriptPubkeyHex: P2WPKH("66") },
     { valueSats: 4000, scriptPubkeyHex: P2WPKH("77") },
