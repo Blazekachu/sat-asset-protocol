@@ -64,4 +64,4 @@ Audit informs **v2+** only unless ADR superseded.
 
 All three Session 03 blockers (Sessions 01–02) were present as completed markdown before this session started, and this session's own deliverable (`03_table_reuse_matrix.md`) is written and cross-linked. No `src/` code was added. No ADR was changed — two potential conflicts were identified and explicitly flagged (not silently resolved) for a future session/ADR author to pick up if ever revisited.
 
-**Next session:** [04-spec-protocol-v1.md](../../sessions/04-spec-protocol-v1.md) (per `sessions/README.md`, can run in parallel anytime).
+**Next step:** protocol v1 spec (`docs/PROTOCOL_SPEC_v1.md`).

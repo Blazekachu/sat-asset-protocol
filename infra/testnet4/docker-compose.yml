@@ -1,5 +1,4 @@
-# Portable /btcfullord equivalent for Linux (Vorflux agent VM or persistent DO/AWS box).
-# Local Windows stack remains: F:\Users\akhil\Main\testnet4 (/btcfullord).
+# Portable testnet4 bitcoind + ord stack. Runs on any Docker host (Linux VM or persistent cloud box).
 #
 #   cp .env.example .env
 #   docker compose up -d --build
