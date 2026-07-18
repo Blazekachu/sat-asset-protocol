@@ -1,6 +1,8 @@
 # ADR-0010: Sat-for-Sat Deferred to v2
 
-**Status:** Accepted  
+> **Update (2026-07-15):** the sat-for-sat deferral is now closed — implemented in v2 per [ADR-0014](./0014-sat-for-sat-offer-accept-sighash-all.md) (Accepted). Superseded in part.
+
+**Status:** Accepted (superseded in part by ADR-0014)  
 **Date:** 2026-07-07  
 **Deciders:** Research phase  
 **Research:** [PSBT Settlement.md](../PSBT%20Settlement.md), [Open Questions.md](../Open%20Questions.md) Q11

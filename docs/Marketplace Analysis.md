@@ -1,6 +1,38 @@
 # Marketplace Analysis
 
-**Status:** Research complete (2026-07-07)
+**Status:** Research complete (2026-07-07); landscape updated (2026-07-15).
+
+---
+
+## 0. 2026 Landscape Update (marketplace-neutral framing)
+
+The specific marketplaces that exist do **not** affect the protocol — Sat Asset
+Protocol stays **marketplace-neutral**: adapters only *map a marketplace's
+listing payload* into the canonical `CreateListingRequest`; they call **no**
+external marketplace API. Which marketplaces are live only changes the doc and
+mapping tables, never the core protocol.
+
+Current state as of 2026-07:
+
+- **Magic Eden** — its **Bitcoin ordinals marketplace has closed**. The
+  `mapMagicEdenListingToCanonical` adapter is retained for reference/back-compat
+  only (`@deprecated`); new integrations should use the generic adapter.
+- **UniSat** — **live**. `mapUniSatCreatePutOnToCanonical` remains the concrete,
+  actively-relevant mapping.
+- **Satflow** — its ordinals marketplace **wound down (2025)**. Never published
+  a pinned rare-sat / range listing-payload schema, so
+  `mapSatflowListingToCanonical` is an **illustrative best-effort** mapping only.
+- **ord.net** — named by the user, but has **no publicly pinned listing-payload
+  schema**, so `mapOrdNetListingToCanonical` is likewise **illustrative
+  best-effort**.
+
+**Reliable integration path.** Because the Satflow/ord.net aliases are
+historical/hypothesized and NOT verified against a live API, the reliable path
+for any marketplace (listed or not) is `mapGenericListingToCanonical` — a
+superset of common aliases — plus `AdapterOverrides` to supply any canonical
+value directly. See `integrations/README.md`, `integrations/generic/README.md`,
+and the per-marketplace READMEs under `integrations/`. Do **not** treat the
+best-effort adapters as asserting live-API compatibility.
 
 ---
 
@@ -16,14 +48,15 @@ All major Bitcoin Ordinals marketplaces use **off-chain signed PSBTs + on-chain 
 
 | Marketplace | Assets | Listing Model | Offer/Bid | Settlement | PSBT Pattern | Public API |
 |-------------|--------|---------------|-----------|------------|--------------|------------|
-| **Magic Eden** | Inscriptions, Runes, rare sats | Seller signs listing PSBT | Unknown (listings focus) | Single atomic tx | `SIGHASH_SINGLE\|ANYONECANPAY` | [ME Ordinals API](https://docs.magiceden.io/reference/ordinals-overview) |
-| **UniSat** | Ordinals, BRC-20, Runes, Alkanes | `create_put_on` → sign PSBT | `create_bid` → `psbtBid` | Atomic on-chain | Standard + auction fields | [Open API v3](https://open-api.unisat.io/) |
+| **Magic Eden** *(BTC ordinals marketplace closed)* | Inscriptions, Runes, rare sats | Seller signs listing PSBT | Unknown (listings focus) | Single atomic tx | `SIGHASH_SINGLE\|ANYONECANPAY` | Closed — mapping retained for reference |
+| **UniSat** *(live)* | Ordinals, BRC-20, Runes, Alkanes | `create_put_on` → sign PSBT | `create_bid` → `psbtBid` | Atomic on-chain | Standard + auction fields | [Open API v3](https://open-api.unisat.io/) |
 | **Magisat** | Rare sats (UTXO) | P2P partial PSBT | Not documented | Atomic on-chain | Listing + buyer wallet prep | **Unknown** |
 | **Sating** | Rare sats (UTXO) | Whole-UTXO listing | Unknown | PSBT-based | Same family | **Unknown** |
 | **Ordinals Wallet** | Inscriptions | Sign-once listing | Unknown | Single atomic tx | Industry standard | Indexing API only |
 | **Gamma** | Inscriptions | PSBT listing | Auctions/editions | On-chain atomic | PSBT + on-chain unlisting | **Unknown** |
 | **OrdinalsBot** | Inscriptions | `create-listing` → base64 PSBT | Listings confirm | PSBT atomic | `SIGHASH_SINGLE\|ANYONECANPAY` | [Marketplace API](https://docs.ordinalsbot.com/marketplace-1/list-ordinals-for-sale) |
-| **Satflow** | Inscriptions, Runes | `POST /intent/sell` | Unknown | PSBT | Standard sighash | [Satflow API](https://docs.satflow.com/reference/post_intent-sell) |
+| **Satflow** *(wound down 2025)* | Inscriptions, Runes | `POST /intent/sell` (historical) | Unknown | PSBT | Standard sighash | Wound down — mapping illustrative best-effort |
+| **ord.net** *(no pinned schema)* | Rare/named sats, ranges | Unknown (no pinned schema) | Unknown | PSBT (assumed) | Assumed standard sighash | No publicly pinned listing schema — best-effort |
 | **SatsX** | OP_NET tokens | NativeSwap price lock | Unknown | WASM contracts | **Not ordinals PSBT** | **Unknown** |
 | **Satonomy** | — | **Not a marketplace** | — | — | — | Wallet tool only |
 

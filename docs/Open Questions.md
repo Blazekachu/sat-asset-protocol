@@ -22,8 +22,8 @@
 | # | Question | Status | Next Step |
 |---|----------|--------|-----------|
 | Q7 | Will ord#2706 ever produce a merged `offers.md` spec? | **UNKNOWN** | Monitor ord repo; protocol may need to lead |
-| Q8 | Optimal bump UTXO size at varying fee rates? | **UNKNOWN** | Fee simulation across congestion levels |
-| Q9 | Minimum postage for bare sats (non-inscription)? | **Open** | 330 sats (inscription convention) vs 546 (dust limit) |
+| Q8 | Optimal bump UTXO size at varying fee rates? | **Resolved — ADR-0015** | Canonical bump 600 sats (configurable); ADR-0006 preserved |
+| Q9 | Minimum postage for bare sats (non-inscription)? | **Resolved — ADR-0015** | Bare-sat 546, inscribed 330 (both configurable) |
 | Q10 | Do all Sats Connect wallets honor per-input `sighashTypes`? | **No (current RPC)** | See [Wallet Sighash Matrix.md](./Wallet%20Sighash%20Matrix.md); empirical Tested? still UNKNOWN |
 | Q11 | Can sat-for-sat work via offer/accept without wallet changes? | **Theoretically yes** | Prototype PSBT on testnet4 |
 | Q12 | Should protocol support 0-bump for compatibility or mandate 2-bump? | **Open** | Stakeholder input from marketplaces |

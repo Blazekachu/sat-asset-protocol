@@ -1,5 +1,12 @@
 # Magic Eden Adapter Mapping
 
+> **Deprecation:** Magic Eden's Bitcoin ordinals marketplace has closed. This
+> mapping (`mapMagicEdenListingToCanonical`) is **retained for reference /
+> back-compat only** and is marked `@deprecated` in code. New integrations
+> should use the marketplace-neutral generic adapter
+> (`mapGenericListingToCanonical` — see `../generic/README.md`) with
+> `AdapterOverrides` where needed. See `docs/Marketplace Analysis.md`.
+
 Status: draft adapter spec for Session 10 (Integrator).  
 Source constraints: `docs/Marketplace Analysis.md`, ADR-0006 canonical two-bump fill.
 

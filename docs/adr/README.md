@@ -45,7 +45,8 @@ Do **not** write ADRs for trivial choices (formatter, folder naming, single-line
 | [0011](./0011-ord-architectural-audit.md) | Ord architectural audit before custom indexer | Accepted |
 | [0012](./0012-reference-implementation-stack-choice.md) | Reference implementation stack choice | Accepted |
 | [0013](./0013-attestation-signature-scheme-ed25519.md) | Attestation signature scheme (Ed25519) | Accepted |
-| [0014](./0014-sat-for-sat-offer-accept-sighash-all.md) | Sat-for-sat via offer/accept (SIGHASH_ALL) | Proposed |
+| [0014](./0014-sat-for-sat-offer-accept-sighash-all.md) | Sat-for-sat via offer/accept (SIGHASH_ALL) | Accepted |
+| [0015](./0015-dust-and-canonical-postage.md) | Per-script-type dust thresholds + canonical postage | Accepted |
 
 ---
 

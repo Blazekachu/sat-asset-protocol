@@ -2,15 +2,26 @@ import { DatabaseSync } from "node:sqlite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { createAttestationRecord, verifyAttestationSignature } from "./attestations.ts";
-import { evaluateCollectionPredicate, listCollectionAssetsPage } from "./collections.ts";
+import {
+  evaluateCollectionPredicate,
+  listCollectionAssetsPage,
+  rarityOfSat,
+  satName,
+} from "./collections.ts";
+import { loadConfig, type ProtocolConfig } from "./config.ts";
+import { DustValidationError } from "./dust.ts";
 import { ListingService, ListingValidationError, type ListingOrdClient } from "./listing-service.ts";
 import { SqliteListingStore } from "./listing-store.ts";
-import type { CreateListingRequest, ListingStore } from "./listing-types.ts";
+import type { CreateListingRequest, CreateOfferRequest, ListingStore } from "./listing-types.ts";
+import { OfferNotFoundError, OfferService } from "./offer-service.ts";
 import {
   buildBuyerFillTemplatePsbt,
   parseListingPsbt,
+  PsbtValidationError,
   validateCanonicalTwoBumpFillPsbt,
+  type TemplateInput,
 } from "./psbt.ts";
+import { buildSatForSatOfferPsbt, type SatForSatAssetSide } from "./sat-for-sat.ts";
 import type { OrdSat, OrdStatus } from "./types.ts";
 
 interface VerifyOrdClient {
@@ -31,6 +42,8 @@ export interface AppDependencies {
   verifyOrdClients?: VerifyOrdClient[];
   now?: () => Date;
   createListingId?: () => string;
+  createOfferId?: () => string;
+  config?: ProtocolConfig;
 }
 
 interface AppInstance {
@@ -50,6 +63,59 @@ function ensureInteger(value: unknown, fieldName: string): number {
   }
 
   return value;
+}
+
+function parseOptionalIntQueryParam(url: URL, name: string): number | undefined {
+  const text = url.searchParams.get(name);
+  if (text === null || text.trim() === "") {
+    return undefined;
+  }
+
+  // Require the value to be a run of digits only; Number.parseInt would
+  // otherwise silently accept partial strings like "123abc" and negative
+  // signs where these routes expect a non-negative integer.
+  if (!/^\d+$/.test(text)) {
+    throw new ListingValidationError(
+      `${name} query param must be a non-negative integer`,
+    );
+  }
+
+  const value = Number.parseInt(text, 10);
+  if (!Number.isSafeInteger(value)) {
+    throw new ListingValidationError(
+      `${name} query param must be a safe integer`,
+    );
+  }
+
+  return value;
+}
+
+/**
+ * Run a PSBT/script build-or-parse callback and translate the plain `Error`s
+ * that `psbt.ts`/`dust.ts` throw for malformed user input (invalid PSBT magic,
+ * missing unsigned tx, invalid script hex, unknown script type, invalid
+ * outpoint, etc.) into a `PsbtValidationError` so the outer catch maps them to
+ * HTTP 400 instead of 500. Errors already typed as client errors are rethrown
+ * unchanged.
+ */
+function mapPsbtUserInputError<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (error) {
+    if (
+      error instanceof ListingValidationError ||
+      error instanceof PsbtValidationError ||
+      error instanceof DustValidationError
+    ) {
+      throw error;
+    }
+
+    if (error instanceof Error) {
+      throw new PsbtValidationError(error.message);
+    }
+
+    throw error;
+  }
 }
 
 function ensureNonEmptyString(value: unknown, fieldName: string): string {
@@ -91,6 +157,126 @@ function parseTemplateInputArray(value: unknown, fieldName: string): TemplateInp
   });
 }
 
+function parseTemplateInput(value: unknown, fieldName: string): TemplateInputPayload {
+  if (!value || typeof value !== "object") {
+    throw new ListingValidationError(`${fieldName} must be an object`);
+  }
+
+  const outpoint = ensureNonEmptyString(
+    (value as Record<string, unknown>).outpoint,
+    `${fieldName}.outpoint`,
+  );
+  const valueSats = ensureInteger(
+    (value as Record<string, unknown>).value_sats,
+    `${fieldName}.value_sats`,
+  );
+  const scriptPubkeyHex = ensureNonEmptyString(
+    (value as Record<string, unknown>).script_pubkey_hex,
+    `${fieldName}.script_pubkey_hex`,
+  );
+
+  return { outpoint, value_sats: valueSats, script_pubkey_hex: scriptPubkeyHex };
+}
+
+function parseAssetTypeQueryParam(url: URL): CreateListingRequest["asset_type"] | undefined {
+  const assetTypeText = url.searchParams.get("asset_type");
+  if (assetTypeText === null || assetTypeText.trim() === "") {
+    return undefined;
+  }
+
+  if (assetTypeText !== "sat" && assetTypeText !== "range" && assetTypeText !== "utxo") {
+    throw new ListingValidationError(
+      `asset_type query param must be one of "sat", "range", "utxo"`,
+    );
+  }
+
+  return assetTypeText;
+}
+
+function toTemplateInput(payload: TemplateInputPayload): TemplateInput {
+  return {
+    outpoint: payload.outpoint,
+    valueSats: payload.value_sats,
+    scriptPubkeyHex: payload.script_pubkey_hex,
+  };
+}
+
+function parseSatForSatSide(value: unknown, fieldName: string): SatForSatAssetSide {
+  if (!value || typeof value !== "object") {
+    throw new ListingValidationError(`${fieldName} must be an object`);
+  }
+
+  const record = value as Record<string, unknown>;
+  const bumpInput = parseTemplateInput(record.bump_input, `${fieldName}.bump_input`);
+  const assetInput = parseTemplateInput(record.asset_input, `${fieldName}.asset_input`);
+  const changeScriptPubkeyHex = ensureNonEmptyString(
+    record.change_script_pubkey_hex,
+    `${fieldName}.change_script_pubkey_hex`,
+  );
+  const counterpartyOrdinalsScriptPubkeyHex = ensureNonEmptyString(
+    record.counterparty_ordinals_script_pubkey_hex,
+    `${fieldName}.counterparty_ordinals_script_pubkey_hex`,
+  );
+
+  return {
+    bumpInput: toTemplateInput(bumpInput),
+    assetInput: toTemplateInput(assetInput),
+    changeScriptPubkeyHex,
+    counterpartyOrdinalsScriptPubkeyHex,
+  };
+}
+
+// Rarity ordering, mirroring collections.ts's private rarityRank, used to
+// filter/annotate discovery results by minimum rarity.
+const RARITY_RANK: Record<string, number> = {
+  common: 0,
+  uncommon: 1,
+  rare: 2,
+  epic: 3,
+  legendary: 4,
+  mythic: 5,
+};
+
+interface AnnotatedListing {
+  listing_id: string;
+  asset_type: CreateListingRequest["asset_type"];
+  sat_number: number | null;
+  sat_name: string | null;
+  rarity: keyof typeof RARITY_RANK | null;
+  outpoint: string | null;
+  price_sats: number;
+  seller_address: string;
+  signed_psbt: string;
+  created_at: string;
+  expires_at: string | null;
+  cancelled: boolean;
+  sat_range_start: number | null;
+  sat_range_size: number | null;
+}
+
+function annotateListing(listing: {
+  listing_id: string;
+  asset_type: CreateListingRequest["asset_type"];
+  sat_number: number | null;
+  outpoint: string | null;
+  price_sats: number;
+  seller_address: string;
+  signed_psbt: string;
+  created_at: string;
+  expires_at: string | null;
+  cancelled: boolean;
+  sat_range_start: number | null;
+  sat_range_size: number | null;
+}): AnnotatedListing {
+  const sat_name = listing.sat_number === null ? null : satName(BigInt(listing.sat_number));
+  const rarity =
+    listing.sat_number === null
+      ? null
+      : (rarityOfSat(BigInt(listing.sat_number)) as keyof typeof RARITY_RANK);
+
+  return { ...listing, sat_name, rarity };
+}
+
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
 
@@ -124,8 +310,19 @@ export function createApp(dependencies: AppDependencies): AppInstance {
     now: dependencies.now,
     createListingId: dependencies.createListingId,
   });
+  const offerService = new OfferService({
+    store: listingStore,
+    ordClient: dependencies.ordClient,
+    now: dependencies.now,
+    createOfferId: dependencies.createOfferId,
+  });
   const verifyOrdClients = dependencies.verifyOrdClients ?? [dependencies.ordClient as VerifyOrdClient];
   const now = dependencies.now ?? (() => new Date());
+  const config = dependencies.config ?? loadConfig();
+  const dustPolicy = {
+    minRelayFeeSatPerVb: config.minRelayFeeSatPerVb,
+    bumpSizeSats: config.bumpSizeSats,
+  };
 
   return {
     handler: async (request, response) => {
@@ -141,20 +338,18 @@ export function createApp(dependencies: AppDependencies): AppInstance {
         }
 
         if (method === "GET" && url.pathname === "/v1/listings") {
-          const satNumberText = url.searchParams.get("sat_number");
           const outpoint = url.searchParams.get("outpoint") ?? undefined;
-          const sat_number =
-            satNumberText === null || satNumberText.trim() === ""
-              ? undefined
-              : Number.parseInt(satNumberText, 10);
-
-          if (satNumberText !== null && sat_number !== undefined && Number.isNaN(sat_number)) {
-            throw new ListingValidationError("sat_number query param must be an integer");
-          }
+          const sat_number = parseOptionalIntQueryParam(url, "sat_number");
+          const sat_range_start = parseOptionalIntQueryParam(url, "sat_range_start");
+          const sat_range_size = parseOptionalIntQueryParam(url, "sat_range_size");
+          const asset_type = parseAssetTypeQueryParam(url);
 
           const listings = listingService.listOpenListings({
             sat_number,
             outpoint,
+            asset_type,
+            sat_range_start,
+            sat_range_size,
           });
 
           writeJson(response, 200, { listings });
@@ -332,10 +527,13 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             throw new ListingValidationError("listing outpoint is missing");
           }
 
-          const validation = validateCanonicalTwoBumpFillPsbt(
-            psbtBase64,
-            listing.outpoint,
-            listing.price_sats,
+          const validation = mapPsbtUserInputError(() =>
+            validateCanonicalTwoBumpFillPsbt(
+              psbtBase64,
+              listing.outpoint as string,
+              listing.price_sats,
+              dustPolicy,
+            ),
           );
 
           writeJson(response, 200, {
@@ -379,7 +577,9 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             throw new ListingValidationError("listing outpoint is missing");
           }
 
-          const parsedListingPsbt = parseListingPsbt(listing.signed_psbt);
+          const parsedListingPsbt = mapPsbtUserInputError(() =>
+            parseListingPsbt(listing.signed_psbt),
+          );
           if (
             parsedListingPsbt.input0WitnessUtxoValue === null ||
             parsedListingPsbt.input0WitnessUtxoScriptPubkeyHex === null
@@ -389,26 +589,21 @@ export function createApp(dependencies: AppDependencies): AppInstance {
             );
           }
 
-          const template = buildBuyerFillTemplatePsbt({
-            sellerOutpoint: listing.outpoint,
-            sellerInputValueSats: parsedListingPsbt.input0WitnessUtxoValue,
-            sellerInputScriptPubkeyHex: parsedListingPsbt.input0WitnessUtxoScriptPubkeyHex,
-            listingPriceSats: listing.price_sats,
-            bumpInputs: bumpInputs.map((input) => ({
-              outpoint: input.outpoint,
-              valueSats: input.value_sats,
-              scriptPubkeyHex: input.script_pubkey_hex,
-            })),
-            fundingInputs: fundingInputs.map((input) => ({
-              outpoint: input.outpoint,
-              valueSats: input.value_sats,
-              scriptPubkeyHex: input.script_pubkey_hex,
-            })),
-            buyerBumpScriptPubkeyHex,
-            buyerAssetScriptPubkeyHex,
-            buyerChangeScriptPubkeyHex,
-            buyerChangeValueSats,
-          });
+          const template = mapPsbtUserInputError(() =>
+            buildBuyerFillTemplatePsbt({
+              sellerOutpoint: listing.outpoint as string,
+              sellerInputValueSats: parsedListingPsbt.input0WitnessUtxoValue as number,
+              sellerInputScriptPubkeyHex:
+                parsedListingPsbt.input0WitnessUtxoScriptPubkeyHex as string,
+              listingPriceSats: listing.price_sats,
+              bumpInputs: bumpInputs.map(toTemplateInput),
+              fundingInputs: fundingInputs.map(toTemplateInput),
+              buyerBumpScriptPubkeyHex,
+              buyerAssetScriptPubkeyHex,
+              buyerChangeScriptPubkeyHex,
+              buyerChangeValueSats,
+            }, dustPolicy),
+          );
 
           writeJson(response, 200, {
             psbt_base64: template.psbtBase64,
@@ -420,9 +615,209 @@ export function createApp(dependencies: AppDependencies): AppInstance {
           return;
         }
 
+        if (method === "POST" && url.pathname === "/v1/sat-for-sat/offers/template") {
+          const body = (await readJsonBody(request)) as Record<string, unknown>;
+          const partyA = parseSatForSatSide(body.party_a, "party_a");
+          const partyB = parseSatForSatSide(body.party_b, "party_b");
+          const feeFundingInput = parseTemplateInput(body.fee_funding_input, "fee_funding_input");
+          const feePayerChangeScriptPubkeyHex = ensureNonEmptyString(
+            body.fee_payer_change_script_pubkey_hex,
+            "fee_payer_change_script_pubkey_hex",
+          );
+          const feePayerChangeValueSats = ensureInteger(
+            body.fee_payer_change_value_sats,
+            "fee_payer_change_value_sats",
+          );
+
+          const template = mapPsbtUserInputError(() =>
+            buildSatForSatOfferPsbt({
+              partyA,
+              partyB,
+              feeFundingInput: toTemplateInput(feeFundingInput),
+              feePayerChangeScriptPubkeyHex,
+              feePayerChangeValueSats,
+              dustPolicy,
+            }),
+          );
+
+          writeJson(response, 200, {
+            psbt_base64: template.psbtBase64,
+            summary: {
+              input_outpoints: template.inputOutpoints,
+              output_values: template.outputValues,
+            },
+          });
+          return;
+        }
+
+        if (method === "POST" && url.pathname === "/v1/sat-for-sat/offers") {
+          const body = (await readJsonBody(request)) as CreateOfferRequest;
+          const offer = await offerService.createOffer(body);
+          writeJson(response, 201, { offer });
+          return;
+        }
+
+        {
+          const acceptMatch = url.pathname.match(
+            /^\/v1\/sat-for-sat\/offers\/([^/]+)\/accept$/,
+          );
+          if (method === "POST" && acceptMatch) {
+            const offerId = decodeURIComponent(acceptMatch[1] ?? "");
+            const body = (await readJsonBody(request)) as Record<string, unknown>;
+            const acceptPsbt = ensureNonEmptyString(body.accept_psbt, "accept_psbt");
+            const offer = await offerService.acceptOffer(offerId, acceptPsbt);
+            writeJson(response, 200, { offer });
+            return;
+          }
+
+          const offerMatch = url.pathname.match(/^\/v1\/sat-for-sat\/offers\/([^/]+)$/);
+          if (method === "GET" && offerMatch) {
+            const offerId = decodeURIComponent(offerMatch[1] ?? "");
+            const offer = offerService.getOffer(offerId);
+            if (!offer) {
+              writeJson(response, 404, { error: "offer not found" });
+              return;
+            }
+
+            writeJson(response, 200, { offer });
+            return;
+          }
+        }
+
+        if (method === "GET" && url.pathname === "/v1/assets/search") {
+          const namePrefix = url.searchParams.get("name_prefix") ?? undefined;
+          const minRarity = url.searchParams.get("rarity") ?? undefined;
+          const satNumberFilter = parseOptionalIntQueryParam(url, "sat_number");
+          const assetTypeFilter = parseAssetTypeQueryParam(url);
+
+          if (minRarity !== undefined && !(minRarity.toLowerCase() in RARITY_RANK)) {
+            throw new ListingValidationError("rarity query param is invalid");
+          }
+
+          const minRarityRank =
+            minRarity === undefined ? null : RARITY_RANK[minRarity.toLowerCase()];
+
+          const assets = listingService
+            .listOpenListings()
+            .map((listing) => annotateListing(listing))
+            .filter((asset) => {
+              if (assetTypeFilter !== undefined && asset.asset_type !== assetTypeFilter) {
+                return false;
+              }
+
+              if (satNumberFilter !== undefined && asset.sat_number !== satNumberFilter) {
+                return false;
+              }
+
+              if (namePrefix !== undefined && namePrefix !== "") {
+                if (asset.sat_name === null || !asset.sat_name.startsWith(namePrefix)) {
+                  return false;
+                }
+              }
+
+              if (minRarityRank !== null) {
+                if (asset.rarity === null || RARITY_RANK[asset.rarity] < minRarityRank) {
+                  return false;
+                }
+              }
+
+              return true;
+            });
+
+          writeJson(response, 200, { assets });
+          return;
+        }
+
+        {
+          const rangeMatch = url.pathname.match(/^\/v1\/assets\/range\/(\d+)\/(\d+)$/);
+          if (method === "GET" && rangeMatch) {
+            const start = Number.parseInt(rangeMatch[1] ?? "0", 10);
+            const end = Number.parseInt(rangeMatch[2] ?? "0", 10);
+            if (start >= end) {
+              throw new ListingValidationError("range start must be less than end");
+            }
+
+            const listings = listingService.listOpenListings().filter((listing) => {
+              if (listing.asset_type === "sat") {
+                return (
+                  listing.sat_number !== null &&
+                  listing.sat_number >= start &&
+                  listing.sat_number < end
+                );
+              }
+
+              if (listing.asset_type === "range") {
+                if (listing.sat_range_start === null || listing.sat_range_size === null) {
+                  return false;
+                }
+
+                const rangeStart = listing.sat_range_start;
+                const rangeEnd = listing.sat_range_start + listing.sat_range_size;
+                // Overlap of [rangeStart, rangeEnd) with [start, end).
+                return rangeStart < end && start < rangeEnd;
+              }
+
+              return false;
+            });
+
+            writeJson(response, 200, { range: { start, end }, listings });
+            return;
+          }
+        }
+
+        {
+          const assetMatch = url.pathname.match(/^\/v1\/assets\/(\d+)$/);
+          if (method === "GET" && assetMatch) {
+            const satNumber = Number.parseInt(assetMatch[1] ?? "0", 10);
+            const satBigInt = BigInt(assetMatch[1] ?? "0");
+            const sat_name = satName(satBigInt);
+            const rarity = rarityOfSat(satBigInt);
+
+            const listings = listingService.listOpenListings({ sat_number: satNumber });
+            const offers = offerService.listOffers({
+              taker_sat_number: satNumber,
+              status: "open",
+            });
+
+            // Custody satpoint is optional: include it only if a sat-capable
+            // ord client resolves it. Works offline (no verify node) too.
+            let custody: string | undefined;
+            for (const client of verifyOrdClients) {
+              try {
+                const sat = await client.sat(satNumber);
+                if (sat.satpoint) {
+                  custody = sat.satpoint;
+                  break;
+                }
+              } catch {
+                // No sat-capable client available; leave custody undefined.
+              }
+            }
+
+            writeJson(response, 200, {
+              sat_number: satNumber,
+              sat_name,
+              rarity,
+              ...(custody !== undefined ? { custody } : {}),
+              listings,
+              offers,
+            });
+            return;
+          }
+        }
+
         writeJson(response, 404, { error: "Not found" });
       } catch (error) {
-        if (error instanceof ListingValidationError) {
+        if (error instanceof OfferNotFoundError) {
+          writeJson(response, 404, { error: error.message });
+          return;
+        }
+
+        if (
+          error instanceof ListingValidationError ||
+          error instanceof PsbtValidationError ||
+          error instanceof DustValidationError
+        ) {
           writeJson(response, 400, { error: error.message });
           return;
         }

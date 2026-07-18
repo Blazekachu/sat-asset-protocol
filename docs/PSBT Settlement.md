@@ -151,7 +151,7 @@ Marketplaces use inconsistent bump counts:
 | Seller sighash | `SIGHASH_SINGLE \| ANYONECANPAY` (0x03) |
 | Seller output index | 0 (payment) |
 | Asset input | Must be sole occupant of UTXO OR sat at offset 0 |
-| Minimum postage | 330 sats (inscription convention) or 546 sats (dust) — **TBD** |
+| Minimum postage | **Resolved — ADR-0015**: bare-sat 546, inscribed 330 (configurable); per-script-type dust threshold |
 
 ### 6.2 Fill PSBT (Buyer) — 2-Bump Canonical
 

@@ -6,6 +6,9 @@ import type {
   ListingQuery,
   ListingRecord,
   ListingStore,
+  OfferQuery,
+  OfferRecord,
+  OfferStatus,
 } from "./listing-types.ts";
 
 function mapListingRow(row: Record<string, unknown>): ListingRecord {
@@ -20,6 +23,29 @@ function mapListingRow(row: Record<string, unknown>): ListingRecord {
     created_at: String(row.created_at),
     expires_at: row.expires_at === null ? null : String(row.expires_at),
     cancelled: Number(row.cancelled) === 1,
+    sat_range_start:
+      row.sat_range_start === null || row.sat_range_start === undefined
+        ? null
+        : Number(row.sat_range_start),
+    sat_range_size:
+      row.sat_range_size === null || row.sat_range_size === undefined
+        ? null
+        : Number(row.sat_range_size),
+  };
+}
+
+function mapOfferRow(row: Record<string, unknown>): OfferRecord {
+  return {
+    offer_id: String(row.offer_id),
+    offerer_sat_number: Number(row.offerer_sat_number),
+    offerer_asset_outpoint: String(row.offerer_asset_outpoint),
+    taker_sat_number: Number(row.taker_sat_number),
+    taker_asset_outpoint: String(row.taker_asset_outpoint),
+    offer_psbt: String(row.offer_psbt),
+    accept_psbt: row.accept_psbt === null ? null : String(row.accept_psbt),
+    status: String(row.status) as OfferStatus,
+    created_at: String(row.created_at),
+    expires_at: row.expires_at === null ? null : String(row.expires_at),
   };
 }
 
@@ -28,6 +54,12 @@ export class SqliteListingStore implements ListingStore {
 
   constructor(database: DatabaseSync) {
     this.#database = database;
+
+    // Schema setup order is load-bearing: create tables, THEN migrate columns
+    // onto any pre-existing tables, THEN create indexes. Indexes that reference
+    // migrated columns (e.g. listings_open_range_idx on sat_range_start) must
+    // come after the migration or an existing DB missing those columns fails
+    // with "no such column" on startup.
     this.#database.exec(`
       CREATE TABLE IF NOT EXISTS listings (
         listing_id TEXT PRIMARY KEY,
@@ -39,12 +71,10 @@ export class SqliteListingStore implements ListingStore {
         signed_psbt TEXT NOT NULL,
         created_at TEXT NOT NULL,
         expires_at TEXT,
-        cancelled INTEGER NOT NULL DEFAULT 0
+        cancelled INTEGER NOT NULL DEFAULT 0,
+        sat_range_start INTEGER,
+        sat_range_size INTEGER
       );
-      CREATE INDEX IF NOT EXISTS listings_open_sat_number_idx
-        ON listings (sat_number, cancelled);
-      CREATE INDEX IF NOT EXISTS listings_open_outpoint_idx
-        ON listings (outpoint, cancelled);
       CREATE TABLE IF NOT EXISTS collections (
         collection_id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -60,9 +90,59 @@ export class SqliteListingStore implements ListingStore {
         expires_at TEXT,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS offers (
+        offer_id TEXT PRIMARY KEY,
+        offerer_sat_number INTEGER NOT NULL,
+        offerer_asset_outpoint TEXT NOT NULL,
+        taker_sat_number INTEGER NOT NULL,
+        taker_asset_outpoint TEXT NOT NULL,
+        offer_psbt TEXT NOT NULL,
+        accept_psbt TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at TEXT NOT NULL,
+        expires_at TEXT
+      );
+    `);
+
+    this.#migrateListingRangeColumns();
+
+    this.#database.exec(`
+      CREATE INDEX IF NOT EXISTS listings_open_sat_number_idx
+        ON listings (sat_number, cancelled);
+      CREATE INDEX IF NOT EXISTS listings_open_outpoint_idx
+        ON listings (outpoint, cancelled);
+      CREATE INDEX IF NOT EXISTS listings_open_range_idx
+        ON listings (sat_range_start, cancelled);
       CREATE INDEX IF NOT EXISTS attestations_subject_sat_idx
         ON attestations (subject_sat, created_at DESC);
+      CREATE INDEX IF NOT EXISTS offers_taker_status_idx
+        ON offers (taker_sat_number, status);
+      CREATE INDEX IF NOT EXISTS offers_offerer_status_idx
+        ON offers (offerer_sat_number, status);
     `);
+  }
+
+  // Idempotent migration for pre-existing DBs created before the range columns
+  // were added. CREATE TABLE IF NOT EXISTS won't alter an existing table, so we
+  // inspect the current columns and add any that are missing.
+  #migrateListingRangeColumns(): void {
+    const existingColumns = new Set(
+      this.#database
+        .prepare("PRAGMA table_info(listings)")
+        .all()
+        .map((row) => String((row as Record<string, unknown>).name)),
+    );
+
+    const requiredColumns: Array<{ name: string; definition: string }> = [
+      { name: "sat_range_start", definition: "sat_range_start INTEGER" },
+      { name: "sat_range_size", definition: "sat_range_size INTEGER" },
+    ];
+
+    for (const column of requiredColumns) {
+      if (!existingColumns.has(column.name)) {
+        this.#database.exec(`ALTER TABLE listings ADD COLUMN ${column.definition}`);
+      }
+    }
   }
 
   insertListing(listing: ListingRecord): void {
@@ -78,8 +158,10 @@ export class SqliteListingStore implements ListingStore {
           signed_psbt,
           created_at,
           expires_at,
-          cancelled
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          cancelled,
+          sat_range_start,
+          sat_range_size
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         listing.listing_id,
@@ -92,6 +174,8 @@ export class SqliteListingStore implements ListingStore {
         listing.created_at,
         listing.expires_at,
         listing.cancelled ? 1 : 0,
+        listing.sat_range_start ?? null,
+        listing.sat_range_size ?? null,
       );
   }
 
@@ -108,7 +192,9 @@ export class SqliteListingStore implements ListingStore {
           signed_psbt,
           created_at,
           expires_at,
-          cancelled
+          cancelled,
+          sat_range_start,
+          sat_range_size
         FROM listings
         WHERE listing_id = ?
         LIMIT 1
@@ -132,6 +218,21 @@ export class SqliteListingStore implements ListingStore {
       values.push(query.outpoint);
     }
 
+    if (query.asset_type !== undefined) {
+      conditions.push("asset_type = ?");
+      values.push(query.asset_type);
+    }
+
+    if (query.sat_range_start !== undefined) {
+      conditions.push("sat_range_start = ?");
+      values.push(query.sat_range_start);
+    }
+
+    if (query.sat_range_size !== undefined) {
+      conditions.push("sat_range_size = ?");
+      values.push(query.sat_range_size);
+    }
+
     const statement = this.#database.prepare(`
       SELECT
         listing_id,
@@ -143,7 +244,9 @@ export class SqliteListingStore implements ListingStore {
         signed_psbt,
         created_at,
         expires_at,
-        cancelled
+        cancelled,
+        sat_range_start,
+        sat_range_size
       FROM listings
       WHERE ${conditions.join(" AND ")}
       ORDER BY created_at DESC, listing_id DESC
@@ -244,5 +347,111 @@ export class SqliteListingStore implements ListingStore {
           created_at: String(typedRow.created_at),
         } satisfies AttestationRecord;
       });
+  }
+
+  insertOffer(record: OfferRecord): void {
+    this.#database
+      .prepare(`
+        INSERT INTO offers (
+          offer_id,
+          offerer_sat_number,
+          offerer_asset_outpoint,
+          taker_sat_number,
+          taker_asset_outpoint,
+          offer_psbt,
+          accept_psbt,
+          status,
+          created_at,
+          expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        record.offer_id,
+        record.offerer_sat_number,
+        record.offerer_asset_outpoint,
+        record.taker_sat_number,
+        record.taker_asset_outpoint,
+        record.offer_psbt,
+        record.accept_psbt,
+        record.status,
+        record.created_at,
+        record.expires_at,
+      );
+  }
+
+  getOffer(offerId: string): OfferRecord | null {
+    const row = this.#database
+      .prepare(`
+        SELECT
+          offer_id,
+          offerer_sat_number,
+          offerer_asset_outpoint,
+          taker_sat_number,
+          taker_asset_outpoint,
+          offer_psbt,
+          accept_psbt,
+          status,
+          created_at,
+          expires_at
+        FROM offers
+        WHERE offer_id = ?
+        LIMIT 1
+      `)
+      .get(offerId) as Record<string, unknown> | undefined;
+
+    return row ? mapOfferRow(row) : null;
+  }
+
+  updateOfferAccept(offerId: string, acceptPsbt: string): OfferRecord | null {
+    this.#database
+      .prepare(`
+        UPDATE offers
+        SET accept_psbt = ?, status = 'accepted'
+        WHERE offer_id = ?
+      `)
+      .run(acceptPsbt, offerId);
+
+    return this.getOffer(offerId);
+  }
+
+  listOffers(query: OfferQuery = {}): OfferRecord[] {
+    const conditions: string[] = [];
+    const values: Array<number | string> = [];
+
+    if (query.taker_sat_number !== undefined) {
+      conditions.push("taker_sat_number = ?");
+      values.push(query.taker_sat_number);
+    }
+
+    if (query.offerer_sat_number !== undefined) {
+      conditions.push("offerer_sat_number = ?");
+      values.push(query.offerer_sat_number);
+    }
+
+    if (query.status !== undefined) {
+      conditions.push("status = ?");
+      values.push(query.status);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    const statement = this.#database.prepare(`
+      SELECT
+        offer_id,
+        offerer_sat_number,
+        offerer_asset_outpoint,
+        taker_sat_number,
+        taker_asset_outpoint,
+        offer_psbt,
+        accept_psbt,
+        status,
+        created_at,
+        expires_at
+      FROM offers
+      ${whereClause}
+      ORDER BY created_at DESC, offer_id DESC
+    `);
+
+    return statement.all(...values).map((row) => mapOfferRow(row as Record<string, unknown>));
   }
 }

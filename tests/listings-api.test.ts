@@ -11,6 +11,13 @@ function encodeVarInt(value: number): Buffer {
     return Buffer.from([value]);
   }
 
+  if (value <= 0xffff) {
+    const buffer = Buffer.alloc(3);
+    buffer.writeUInt8(0xfd, 0);
+    buffer.writeUInt16LE(value, 1);
+    return buffer;
+  }
+
   throw new Error(`Unsupported varint value for test fixture: ${value}`);
 }
 
@@ -48,6 +55,59 @@ function buildUnsignedTransaction(outpoint: string, outputValue: number): Buffer
   ];
 
   return Buffer.concat(parts);
+}
+
+function encodeMultiInputUnsignedTransaction(
+  inputOutpoints: string[],
+  outputs: Array<{ valueSats: number; scriptPubkeyHex: string }>,
+): Buffer {
+  const parts: Buffer[] = [encodeUInt32LE(2), encodeVarInt(inputOutpoints.length)];
+
+  for (const outpoint of inputOutpoints) {
+    const [txid, voutText] = outpoint.split(":");
+    parts.push(hexToReversedBuffer(txid));
+    parts.push(encodeUInt32LE(Number(voutText)));
+    parts.push(Buffer.from([0x00]));
+    parts.push(encodeUInt32LE(0xfffffffd));
+  }
+
+  parts.push(encodeVarInt(outputs.length));
+  for (const output of outputs) {
+    parts.push(encodeUInt64LE(output.valueSats));
+    const script = Buffer.from(output.scriptPubkeyHex, "hex");
+    parts.push(encodeVarInt(script.length));
+    parts.push(script);
+  }
+
+  parts.push(encodeUInt32LE(0));
+  return Buffer.concat(parts);
+}
+
+// Build a minimal canonical 2-bump fill PSBT (unsigned tx only) whose seller
+// input sits at index 2 (matching `sellerOutpoint`). Outputs are provided by
+// the caller so tests can craft sub-dust outputs.
+function buildFillPsbt(
+  sellerOutpoint: string,
+  outputs: Array<{ valueSats: number; scriptPubkeyHex: string }>,
+): string {
+  const inputOutpoints = [
+    "a".repeat(64) + ":0",
+    "b".repeat(64) + ":1",
+    sellerOutpoint,
+    "c".repeat(64) + ":2",
+  ];
+
+  const unsignedTx = encodeMultiInputUnsignedTransaction(inputOutpoints, outputs);
+
+  const globalMap = Buffer.concat([
+    encodeVarInt(1),
+    Buffer.from([0x00]),
+    encodeVarInt(unsignedTx.length),
+    unsignedTx,
+    Buffer.from([0x00]),
+  ]);
+
+  return Buffer.concat([Buffer.from("70736274ff", "hex"), globalMap]).toString("base64");
 }
 
 function buildSignedListingPsbt(outpoint: string, priceSats: number): string {
@@ -219,6 +279,300 @@ test("POST /v1/listings rejects a sat that is not at offset 0", async () => {
       assert.equal(response.status, 400);
       const body = (await response.json()) as { error: string };
       assert.match(body.error, /offset 0/i);
+    },
+  );
+});
+
+test("POST /v1/psbt/validate rejects a fill PSBT with a sub-dust output", async () => {
+  const outpoint = "3333333333333333333333333333333333333333333333333333333333333333:0";
+  const priceSats = 1000;
+
+  await withServer(
+    {
+      address: "tb1qexample",
+      confirmations: 5,
+      indexed: true,
+      inscriptions: [],
+      outpoint,
+      runes: {},
+      sat_ranges: [[12345, 12346]],
+      script_pubkey: "",
+      spent: false,
+      transaction: "3333333333333333333333333333333333333333333333333333333333333333",
+      value: 5000,
+    },
+    async (baseUrl) => {
+      const signedPsbt = buildSignedListingPsbt(outpoint, priceSats);
+
+      const createResponse = await fetch(new URL("/v1/listings", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          asset_type: "sat",
+          sat_number: 12345,
+          outpoint,
+          price_sats: priceSats,
+          seller_address: "tb1qseller000000000000000000000000000000000",
+          signed_psbt: signedPsbt,
+        }),
+      });
+      assert.equal(createResponse.status, 201);
+
+      // Output 3 (buyer change) is a P2WPKH worth 100 sats — below the 294-sat
+      // P2WPKH dust threshold at the default 3 sat/vB fee rate.
+      const p2wpkh = (fill: string) => "0014" + fill.repeat(20);
+      const fillPsbt = buildFillPsbt(outpoint, [
+        { valueSats: 1200, scriptPubkeyHex: p2wpkh("66") },
+        { valueSats: 4000, scriptPubkeyHex: p2wpkh("77") },
+        { valueSats: priceSats, scriptPubkeyHex: p2wpkh("88") },
+        { valueSats: 100, scriptPubkeyHex: p2wpkh("99") },
+      ]);
+
+      const response = await fetch(new URL("/v1/psbt/validate", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          listing_id: "listing-test-id",
+          psbt_base64: fillPsbt,
+        }),
+      });
+
+      assert.equal(response.status, 400);
+      const body = (await response.json()) as { error: string };
+      assert.match(body.error, /dust/i);
+    },
+  );
+});
+
+test("POST /v1/psbt/validate accepts a canonical fill PSBT with dust-safe outputs", async () => {
+  const outpoint = "4444444444444444444444444444444444444444444444444444444444444444:0";
+  const priceSats = 1000;
+
+  await withServer(
+    {
+      address: "tb1qexample",
+      confirmations: 5,
+      indexed: true,
+      inscriptions: [],
+      outpoint,
+      runes: {},
+      sat_ranges: [[12345, 12346]],
+      script_pubkey: "",
+      spent: false,
+      transaction: "4444444444444444444444444444444444444444444444444444444444444444",
+      value: 5000,
+    },
+    async (baseUrl) => {
+      const signedPsbt = buildSignedListingPsbt(outpoint, priceSats);
+
+      const createResponse = await fetch(new URL("/v1/listings", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          asset_type: "sat",
+          sat_number: 12345,
+          outpoint,
+          price_sats: priceSats,
+          seller_address: "tb1qseller000000000000000000000000000000000",
+          signed_psbt: signedPsbt,
+        }),
+      });
+      assert.equal(createResponse.status, 201);
+
+      const p2wpkh = (fill: string) => "0014" + fill.repeat(20);
+      const fillPsbt = buildFillPsbt(outpoint, [
+        { valueSats: 1200, scriptPubkeyHex: p2wpkh("66") },
+        { valueSats: 4000, scriptPubkeyHex: p2wpkh("77") },
+        { valueSats: priceSats, scriptPubkeyHex: p2wpkh("88") },
+        { valueSats: 3000, scriptPubkeyHex: p2wpkh("99") },
+      ]);
+
+      const response = await fetch(new URL("/v1/psbt/validate", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          listing_id: "listing-test-id",
+          psbt_base64: fillPsbt,
+        }),
+      });
+
+      assert.equal(response.status, 200);
+      const body = (await response.json()) as {
+        valid: boolean;
+        summary: { seller_input_index: number; buyer_input_count: number };
+      };
+      assert.equal(body.valid, true);
+      assert.equal(body.summary.seller_input_index, 2);
+      assert.equal(body.summary.buyer_input_count, 3);
+    },
+  );
+});
+
+test("POST /v1/psbt/validate returns 400 (not 500) for a malformed PSBT", async () => {
+  const outpoint = "5555555555555555555555555555555555555555555555555555555555555555:0";
+  const priceSats = 1000;
+
+  await withServer(
+    {
+      address: "tb1qexample",
+      confirmations: 5,
+      indexed: true,
+      inscriptions: [],
+      outpoint,
+      runes: {},
+      sat_ranges: [[12345, 12346]],
+      script_pubkey: "",
+      spent: false,
+      transaction: "5555555555555555555555555555555555555555555555555555555555555555",
+      value: 5000,
+    },
+    async (baseUrl) => {
+      const signedPsbt = buildSignedListingPsbt(outpoint, priceSats);
+      const createResponse = await fetch(new URL("/v1/listings", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          asset_type: "sat",
+          sat_number: 12345,
+          outpoint,
+          price_sats: priceSats,
+          seller_address: "tb1qseller000000000000000000000000000000000",
+          signed_psbt: signedPsbt,
+        }),
+      });
+      assert.equal(createResponse.status, 201);
+
+      // "not-a-psbt" lacks the PSBT magic prefix -> parse throws a plain Error.
+      const response = await fetch(new URL("/v1/psbt/validate", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          listing_id: "listing-test-id",
+          psbt_base64: Buffer.from("not-a-psbt").toString("base64"),
+        }),
+      });
+
+      assert.equal(response.status, 400);
+    },
+  );
+});
+
+test("POST /v1/psbt/template returns 400 (not 500) for a bad bump input outpoint", async () => {
+  const outpoint = "6666666666666666666666666666666666666666666666666666666666666666:0";
+  const priceSats = 1000;
+
+  await withServer(
+    {
+      address: "tb1qexample",
+      confirmations: 5,
+      indexed: true,
+      inscriptions: [],
+      outpoint,
+      runes: {},
+      sat_ranges: [[12345, 12346]],
+      script_pubkey: "",
+      spent: false,
+      transaction: "6666666666666666666666666666666666666666666666666666666666666666",
+      value: 5000,
+    },
+    async (baseUrl) => {
+      const signedPsbt = buildSignedListingPsbt(outpoint, priceSats);
+      const createResponse = await fetch(new URL("/v1/listings", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          asset_type: "sat",
+          sat_number: 12345,
+          outpoint,
+          price_sats: priceSats,
+          seller_address: "tb1qseller000000000000000000000000000000000",
+          signed_psbt: signedPsbt,
+        }),
+      });
+      assert.equal(createResponse.status, 201);
+
+      const p2wpkh = (fill: string) => "0014" + fill.repeat(20);
+      // "not-an-outpoint" fails the outpoint format check in buildUnsignedTransaction.
+      const response = await fetch(new URL("/v1/psbt/template", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          listing_id: "listing-test-id",
+          bump_inputs: [
+            { outpoint: "not-an-outpoint", value_sats: 600, script_pubkey_hex: p2wpkh("11") },
+            { outpoint: "b".repeat(64) + ":1", value_sats: 600, script_pubkey_hex: p2wpkh("22") },
+          ],
+          funding_inputs: [
+            { outpoint: "c".repeat(64) + ":2", value_sats: 5000, script_pubkey_hex: p2wpkh("33") },
+          ],
+          buyer_bump_script_pubkey_hex: p2wpkh("44"),
+          buyer_asset_script_pubkey_hex: p2wpkh("55"),
+          buyer_change_script_pubkey_hex: p2wpkh("66"),
+          buyer_change_value_sats: 3000,
+        }),
+      });
+
+      assert.equal(response.status, 400);
+    },
+  );
+});
+
+test("POST /v1/psbt/template returns 400 (not 500) for invalid buyer change script hex", async () => {
+  const outpoint = "7777777777777777777777777777777777777777777777777777777777777777:0";
+  const priceSats = 1000;
+
+  await withServer(
+    {
+      address: "tb1qexample",
+      confirmations: 5,
+      indexed: true,
+      inscriptions: [],
+      outpoint,
+      runes: {},
+      sat_ranges: [[12345, 12346]],
+      script_pubkey: "",
+      spent: false,
+      transaction: "7777777777777777777777777777777777777777777777777777777777777777",
+      value: 5000,
+    },
+    async (baseUrl) => {
+      const signedPsbt = buildSignedListingPsbt(outpoint, priceSats);
+      const createResponse = await fetch(new URL("/v1/listings", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          asset_type: "sat",
+          sat_number: 12345,
+          outpoint,
+          price_sats: priceSats,
+          seller_address: "tb1qseller000000000000000000000000000000000",
+          signed_psbt: signedPsbt,
+        }),
+      });
+      assert.equal(createResponse.status, 201);
+
+      const p2wpkh = (fill: string) => "0014" + fill.repeat(20);
+      const response = await fetch(new URL("/v1/psbt/template", baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          listing_id: "listing-test-id",
+          bump_inputs: [
+            { outpoint: "a".repeat(64) + ":0", value_sats: 600, script_pubkey_hex: p2wpkh("11") },
+            { outpoint: "b".repeat(64) + ":1", value_sats: 600, script_pubkey_hex: p2wpkh("22") },
+          ],
+          funding_inputs: [
+            { outpoint: "c".repeat(64) + ":2", value_sats: 5000, script_pubkey_hex: p2wpkh("33") },
+          ],
+          buyer_bump_script_pubkey_hex: p2wpkh("44"),
+          buyer_asset_script_pubkey_hex: p2wpkh("55"),
+          // Odd-length / non-hex change script -> encodeScript throws a plain Error.
+          buyer_change_script_pubkey_hex: "xyz",
+          buyer_change_value_sats: 3000,
+        }),
+      });
+
+      assert.equal(response.status, 400);
     },
   );
 });

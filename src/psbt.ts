@@ -1,8 +1,59 @@
-const PSBT_MAGIC = Buffer.from("70736274ff", "hex");
+import {
+  assertOutputAboveDust,
+  classifyScript,
+  dustThresholdForScript,
+  DustValidationError,
+} from "./dust.ts";
+
+export const PSBT_MAGIC = Buffer.from("70736274ff", "hex");
+
+const DEFAULT_MIN_RELAY_FEE_SAT_PER_VB = 3;
+const DEFAULT_BUMP_SIZE_SATS = 600;
+
+/**
+ * Optional dust policy for the v1 canonical fill PSBT paths. Defaults match the
+ * protocol config defaults (min-relay fee 3 sat/vB, 600-sat bumps) so existing
+ * callers/tests that omit it keep the ADR-0006 canonical behavior. psbt.ts does
+ * NOT read process.env — callers thread these in from ProtocolConfig.
+ */
+export interface DustPolicy {
+  minRelayFeeSatPerVb?: number;
+  bumpSizeSats?: number;
+}
+
+/**
+ * Raised when a PSBT fails a structural or canonical-invariant validation in
+ * {@link validateCanonicalTwoBumpFillPsbt}. Exported so the server can map it to
+ * HTTP 400 without importing listing-service concerns. Dust-specific failures
+ * throw {@link DustValidationError} from ./dust.ts instead.
+ */
+export class PsbtValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PsbtValidationError";
+  }
+}
 
 interface ReaderState {
   readonly buffer: Buffer;
   offset: number;
+}
+
+export type PsbtSignatureSource = "partial_sig" | "tap_key_sig";
+
+/**
+ * A single parsed signature entry from a PSBT input, keeping the signature
+ * *source* alongside its sighash so consumers can apply source-specific rules.
+ * `sighashAllEquivalent` is true only for a structurally well-formed signature
+ * that commits to SIGHASH_ALL — i.e. a 64-byte Taproot key signature
+ * (SIGHASH_DEFAULT), a 65-byte Taproot key signature with an explicit `0x01`
+ * byte, or a plausible-DER ECDSA partial signature with a `0x01` sighash byte.
+ * Malformed, empty, or non-ALL signatures are `false`.
+ */
+export interface ParsedPsbtSignature {
+  source: PsbtSignatureSource;
+  sighashType: number | null;
+  sighashAllEquivalent: boolean;
 }
 
 export interface ParsedPsbtInput {
@@ -10,6 +61,8 @@ export interface ParsedPsbtInput {
   sequence: number;
   sighashType: number | null;
   partialSigCount: number;
+  /** Per-signature detail (source + sighash + ALL-equivalence). */
+  signatures: ParsedPsbtSignature[];
   witnessUtxoValue: number | null;
   witnessUtxoScriptPubkeyHex: string | null;
 }
@@ -109,7 +162,7 @@ function readVarInt(reader: ReaderState): number {
   return value;
 }
 
-function encodeVarInt(value: number): Buffer {
+export function encodeVarInt(value: number): Buffer {
   if (!Number.isInteger(value) || value < 0) {
     throw new Error("Cannot encode negative or non-integer varint");
   }
@@ -310,6 +363,92 @@ function parsePsbtUnsignedOnly(psbtBase64: string): {
   return parseUnsignedTransaction(unsignedTxEntry.value);
 }
 
+/**
+ * Return the raw serialized unsigned transaction bytes from the PSBT global-map
+ * `0x00` entry. Reuses the structure parser so the returned buffer is exactly
+ * the version + inputs + outputs + locktime serialization stored in the PSBT.
+ * Used for byte-identical comparison between an offer and its accept PSBT.
+ */
+export function unsignedTxBytes(psbtBase64: string): Buffer {
+  const structure = parsePsbtStructure(psbtBase64);
+  return Buffer.from(structure.unsignedTx);
+}
+
+/**
+ * True when a sighash type is SIGHASH_ALL-equivalent for validation purposes.
+ * Both SIGHASH_DEFAULT (`0x00`, Taproot 64-byte key-sig) and SIGHASH_ALL
+ * (`0x01`) commit to all inputs and outputs, so consumers treat them as
+ * equivalent. `null` (no sighash present) is not considered equivalent.
+ *
+ * NOTE: this raw-value check does not distinguish signature *source*. `0x00`
+ * is only safe for a 64-byte Taproot key signature; for an ECDSA partial
+ * signature `0x00` is not a valid sighash flag. Prefer
+ * {@link inputHasSighashAllSignature}, which enforces source-specific structural
+ * validity. This helper is retained for the legacy per-value use in
+ * {@link parseListingPsbt} consumers that supply their own explicit sighash
+ * range checks.
+ */
+export function isSighashAllEquivalent(sighashType: number | null): boolean {
+  return sighashType === 0x00 || sighashType === 0x01;
+}
+
+/**
+ * True when an input carries at least one structurally valid SIGHASH_ALL(-
+ * equivalent) signature. This is the safe gate for "is this input actually
+ * signed with a full-commitment signature", rejecting empty/one-byte/malformed
+ * signature values that would otherwise be mistaken for SIGHASH_DEFAULT.
+ */
+export function inputHasSighashAllSignature(input: ParsedPsbtInput): boolean {
+  return input.signatures.some((signature) => signature.sighashAllEquivalent);
+}
+
+/**
+ * Classify a raw PSBT_IN_PARTIAL_SIG (`0x02`) value. A legacy/segwit ECDSA
+ * signature is a DER-encoded signature followed by a single sighash byte, so
+ * the minimum plausible length is a DER header (`0x30 len`) plus the two
+ * INTEGER components plus the trailing sighash byte. We do not fully verify the
+ * DER, but we require the DER sequence tag, a self-consistent length, and an
+ * explicit trailing sighash byte. Only `0x01` (SIGHASH_ALL) is ALL-equivalent
+ * for an ECDSA partial signature (`0x00` is NOT a valid ECDSA sighash flag).
+ */
+function classifyPartialSig(value: Buffer): ParsedPsbtSignature {
+  // Smallest realistic DER ECDSA sig: 30 06 02 01 xx 02 01 xx = 8 bytes, plus
+  // the trailing sighash byte = 9 bytes total.
+  const looksLikeDer =
+    value.length >= 9 &&
+    value[0] === 0x30 &&
+    // DER content length byte matches the bytes between it and the sighash byte.
+    value[1] === value.length - 3;
+  const sighashType = value.length > 0 ? (value[value.length - 1] ?? null) : null;
+  return {
+    source: "partial_sig",
+    sighashType,
+    sighashAllEquivalent: looksLikeDer && sighashType === 0x01,
+  };
+}
+
+/**
+ * Classify a raw PSBT_IN_TAP_KEY_SIG (`0x13`) value (BIP371). A Taproot
+ * key-path signature is exactly 64 bytes (implicit SIGHASH_DEFAULT `0x00`) or
+ * 65 bytes (the 65th byte is an explicit sighash flag, which must be `0x01`
+ * SIGHASH_ALL to be ALL-equivalent; `0x00` is disallowed as an explicit byte).
+ * Any other length (including empty) is malformed and not ALL-equivalent.
+ */
+function classifyTapKeySig(value: Buffer): ParsedPsbtSignature {
+  if (value.length === 64) {
+    return { source: "tap_key_sig", sighashType: 0x00, sighashAllEquivalent: true };
+  }
+  if (value.length === 65) {
+    const sighashType = value[64] ?? null;
+    return {
+      source: "tap_key_sig",
+      sighashType,
+      sighashAllEquivalent: sighashType === 0x01,
+    };
+  }
+  return { source: "tap_key_sig", sighashType: null, sighashAllEquivalent: false };
+}
+
 export function parsePsbt(psbtBase64: string): ParsedPsbt {
   const structure = parsePsbtStructure(psbtBase64);
   const unsignedTransaction = parseUnsignedTransaction(structure.unsignedTx);
@@ -317,20 +456,20 @@ export function parsePsbt(psbtBase64: string): ParsedPsbt {
   const inputs: ParsedPsbtInput[] = unsignedTransaction.inputs.map((input, index) => {
     const inputEntries = structure.inputMaps[index] ?? [];
 
-    let sighashType: number | null = null;
-    let partialSigCount = 0;
+    const signatures: ParsedPsbtSignature[] = [];
+    let explicitSighashType: number | null = null;
     let witnessUtxoValue: number | null = null;
     let witnessUtxoScriptPubkeyHex: string | null = null;
 
     for (const entry of inputEntries) {
       const keyType = entry.key[0];
       if (keyType === 0x02) {
-        partialSigCount += 1;
-        if (entry.value.length > 0 && sighashType === null) {
-          sighashType = entry.value[entry.value.length - 1] ?? null;
-        }
+        signatures.push(classifyPartialSig(entry.value));
       } else if (keyType === 0x03 && entry.value.length >= 4) {
-        sighashType = entry.value.readUInt32LE(0);
+        // PSBT_IN_SIGHASH_TYPE: an explicit whole-input sighash declaration.
+        explicitSighashType = entry.value.readUInt32LE(0);
+      } else if (keyType === 0x13) {
+        signatures.push(classifyTapKeySig(entry.value));
       } else if (keyType === 0x01) {
         const witnessUtxo = parseWitnessUtxo(entry.value);
         witnessUtxoValue = witnessUtxo.value;
@@ -338,11 +477,16 @@ export function parsePsbt(psbtBase64: string): ParsedPsbt {
       }
     }
 
+    // Surface a single representative sighash for back-compat consumers: an
+    // explicit PSBT_IN_SIGHASH_TYPE (0x03) wins, else the first signature's.
+    const sighashType = explicitSighashType ?? signatures[0]?.sighashType ?? null;
+
     return {
       outpoint: input.outpoint,
       sequence: input.sequence,
       sighashType,
-      partialSigCount,
+      partialSigCount: signatures.length,
+      signatures,
       witnessUtxoValue,
       witnessUtxoScriptPubkeyHex,
     };
@@ -371,13 +515,13 @@ export function parseListingPsbt(psbtBase64: string): ParsedListingPsbt {
   };
 }
 
-function encodeUInt32LE(value: number): Buffer {
+export function encodeUInt32LE(value: number): Buffer {
   const buffer = Buffer.alloc(4);
   buffer.writeUInt32LE(value, 0);
   return buffer;
 }
 
-function encodeUInt64LE(value: number): Buffer {
+export function encodeUInt64LE(value: number): Buffer {
   const buffer = Buffer.alloc(8);
   buffer.writeBigUInt64LE(BigInt(value), 0);
   return buffer;
@@ -392,7 +536,7 @@ function encodeScript(scriptPubkeyHex: string): Buffer {
   return Buffer.concat([encodeVarInt(script.length), script]);
 }
 
-function buildUnsignedTransaction(
+export function buildUnsignedTransaction(
   inputOutpoints: string[],
   outputValuesAndScripts: Array<{ valueSats: number; scriptPubkeyHex: string }>,
 ): Buffer {
@@ -414,20 +558,26 @@ function buildUnsignedTransaction(
   return Buffer.concat(parts);
 }
 
-function encodeMapEntry(key: Buffer, value: Buffer): Buffer {
+export function encodeMapEntry(key: Buffer, value: Buffer): Buffer {
   return Buffer.concat([encodeVarInt(key.length), key, encodeVarInt(value.length), value]);
 }
 
-function encodeWitnessUtxoMap(valueSats: number, scriptPubkeyHex: string): Buffer {
+export function encodeWitnessUtxoMap(valueSats: number, scriptPubkeyHex: string): Buffer {
   const payload = Buffer.concat([encodeUInt64LE(valueSats), encodeScript(scriptPubkeyHex)]);
   return encodeMapEntry(Buffer.from([0x01]), payload);
 }
 
-export function buildBuyerFillTemplatePsbt(params: BuyerFillTemplateParams): {
+export function buildBuyerFillTemplatePsbt(
+  params: BuyerFillTemplateParams,
+  dustPolicy: DustPolicy = {},
+): {
   psbtBase64: string;
   inputOutpoints: string[];
   outputValues: number[];
 } {
+  const minRelayFeeSatPerVb =
+    dustPolicy.minRelayFeeSatPerVb ?? DEFAULT_MIN_RELAY_FEE_SAT_PER_VB;
+
   if (params.bumpInputs.length !== 2) {
     throw new Error("Canonical template requires exactly 2 bump inputs");
   }
@@ -459,6 +609,10 @@ export function buildBuyerFillTemplatePsbt(params: BuyerFillTemplateParams): {
     { valueSats: params.buyerChangeValueSats, scriptPubkeyHex: params.buyerChangeScriptPubkeyHex },
   ];
 
+  for (const output of outputs) {
+    assertOutputAboveDust(output.scriptPubkeyHex, output.valueSats, minRelayFeeSatPerVb);
+  }
+
   const unsignedTransaction = buildUnsignedTransaction(inputOutpoints, outputs);
 
   const inputMaps: Buffer[] = [
@@ -487,28 +641,46 @@ export function validateCanonicalTwoBumpFillPsbt(
   fillPsbtBase64: string,
   listingOutpoint: string,
   listingPriceSats: number,
+  dustPolicy: DustPolicy = {},
 ): { sellerInputIndex: number; buyerInputCount: number } {
+  const minRelayFeeSatPerVb =
+    dustPolicy.minRelayFeeSatPerVb ?? DEFAULT_MIN_RELAY_FEE_SAT_PER_VB;
+  const bumpSizeSats = dustPolicy.bumpSizeSats ?? DEFAULT_BUMP_SIZE_SATS;
+
   const parsed = parsePsbtUnsignedOnly(fillPsbtBase64);
 
   if (parsed.inputs.length < 4) {
-    throw new Error("Canonical 2-bump fill must include 4+ inputs");
+    throw new PsbtValidationError("Canonical 2-bump fill must include 4+ inputs");
   }
 
   const sellerInputIndex = parsed.inputs.findIndex((input) => input.outpoint === listingOutpoint);
   if (sellerInputIndex !== 2) {
-    throw new Error("Canonical 2-bump fill must place seller input at index 2");
+    throw new PsbtValidationError("Canonical 2-bump fill must place seller input at index 2");
   }
 
   if (parsed.outputs.length < 4) {
-    throw new Error("Canonical 2-bump fill must include 4+ outputs");
+    throw new PsbtValidationError("Canonical 2-bump fill must include 4+ outputs");
   }
 
-  if (parsed.outputs[0]?.value !== 1200) {
-    throw new Error("Output 0 must be canonical 1200-sat bump passthrough");
+  if (parsed.outputs[0]?.value !== 2 * bumpSizeSats) {
+    throw new PsbtValidationError("Output 0 must be canonical 1200-sat bump passthrough");
   }
 
   if (parsed.outputs[2]?.value !== listingPriceSats) {
-    throw new Error("Output 2 must pay listing price to seller");
+    throw new PsbtValidationError("Output 2 must pay listing price to seller");
+  }
+
+  for (const output of parsed.outputs) {
+    if (classifyScript(output.scriptPubkeyHex) === "op_return") {
+      continue;
+    }
+
+    const threshold = dustThresholdForScript(output.scriptPubkeyHex, minRelayFeeSatPerVb);
+    if (output.value < threshold) {
+      throw new DustValidationError(
+        `output value ${output.value} below dust threshold ${threshold}`,
+      );
+    }
   }
 
   const buyerInputCount = parsed.inputs.length - 1;
